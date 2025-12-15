@@ -219,6 +219,11 @@ impl RendezvousClient {
         Ok(())
     }
 
+    async fn shutdown(&mut self) -> Result<()> {
+        self.ws_sender.close().await?;
+        Ok(())
+    }
+
     async fn recv_message(&mut self) -> Result<crate::messages::Message> {
         if !self.pending_messages.is_empty() {
             return Ok(self.pending_messages.remove(0));
@@ -357,6 +362,7 @@ pub async fn send_text(
         std::io::stdin().read_line(&mut input)?;
         if input.trim() != "yes" {
             client.close(Mood::Errory).await?;
+            client.shutdown().await?;
             anyhow::bail!("Verification rejected");
         }
     }
@@ -390,6 +396,7 @@ pub async fn send_text(
 
     client.release(&nameplate).await?;
     client.close(Mood::Happy).await?;
+    client.shutdown().await?;
 
     Ok(())
 }
@@ -442,6 +449,7 @@ pub async fn send_file(
         std::io::stdin().read_line(&mut input)?;
         if input.trim() != "yes" {
             client.close(Mood::Errory).await?;
+            client.shutdown().await?;
             anyhow::bail!("Verification rejected");
         }
     }
@@ -512,6 +520,7 @@ pub async fn send_file(
 
     client.release(&nameplate).await?;
     client.close(Mood::Happy).await?;
+    client.shutdown().await?;
 
     Ok(())
 }
@@ -564,6 +573,7 @@ pub async fn send_directory(
         std::io::stdin().read_line(&mut input)?;
         if input.trim() != "yes" {
             client.close(Mood::Errory).await?;
+            client.shutdown().await?;
             anyhow::bail!("Verification rejected");
         }
     }
@@ -640,6 +650,7 @@ pub async fn send_directory(
 
     client.release(&nameplate).await?;
     client.close(Mood::Happy).await?;
+    client.shutdown().await?;
 
     Ok(())
 }
@@ -672,6 +683,7 @@ pub async fn receive(
         std::io::stdin().read_line(&mut input)?;
         if input.trim() != "yes" {
             client.close(Mood::Errory).await?;
+            client.shutdown().await?;
             anyhow::bail!("Verification rejected");
         }
     }
@@ -716,6 +728,7 @@ pub async fn receive(
 
         client.release(nameplate).await?;
         client.close(Mood::Happy).await?;
+        client.shutdown().await?;
     } else if let Some(file_offer) = offer.file {
         let output_path = output_dir
             .map(|d| d.join(&file_offer.filename))
@@ -739,6 +752,7 @@ pub async fn receive(
                 };
                 send_app_data(&mut client, &shared_key, 0, &reject).await?;
                 client.close(Mood::Happy).await?;
+                client.shutdown().await?;
                 anyhow::bail!("Transfer rejected");
             }
         }
@@ -785,6 +799,7 @@ pub async fn receive(
 
         client.release(nameplate).await?;
         client.close(Mood::Happy).await?;
+        client.shutdown().await?;
     } else if let Some(dir_offer) = offer.directory {
         let output_path = output_dir
             .map(|d| d.join(&dir_offer.dirname))
@@ -808,6 +823,7 @@ pub async fn receive(
                 };
                 send_app_data(&mut client, &shared_key, 0, &reject).await?;
                 client.close(Mood::Happy).await?;
+                client.shutdown().await?;
                 anyhow::bail!("Transfer rejected");
             }
         }
@@ -854,6 +870,7 @@ pub async fn receive(
 
         client.release(nameplate).await?;
         client.close(Mood::Happy).await?;
+        client.shutdown().await?;
     } else {
         anyhow::bail!("Unknown offer type");
     }
