@@ -1,6 +1,6 @@
 [package]
 name = "wormhole-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["liberodark"]
 description = "Magic Wormhole implementation with built-in server"
@@ -14,7 +14,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 anyhow = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "fs", "time"] }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 spake2 = "0.4"
 hkdf = "0.12"
