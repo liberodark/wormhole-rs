@@ -1,13 +1,14 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -17,7 +18,8 @@ use crate::crypto::{
 };
 use crate::messages::{TransferAck, Transit, TransitHint};
 
-const RECORD_SIZE: usize = 16384 - 16;
+const RECORD_SIZE: usize = 65536 - 16; // 64KB
+const TCP_BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
 
 fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
     if hide_progress {
@@ -35,11 +37,12 @@ fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
 }
 
 pub struct TransitConnection {
-    stream: Mutex<TcpStream>,
-    send_key: [u8; KEY_SIZE],
-    recv_key: [u8; KEY_SIZE],
-    send_nonce: Mutex<u64>,
-    recv_nonce: Mutex<u64>,
+    reader: Mutex<BufReader<tokio::io::ReadHalf<TcpStream>>>,
+    writer: Mutex<BufWriter<tokio::io::WriteHalf<TcpStream>>>,
+    send_cipher: XSalsa20Poly1305,
+    recv_cipher: XSalsa20Poly1305,
+    send_nonce: AtomicU64,
+    recv_nonce: AtomicU64,
 }
 
 impl TransitConnection {
@@ -56,46 +59,54 @@ impl TransitConnection {
             )
         };
 
+        let send_cipher = XSalsa20Poly1305::new(Key::from_slice(&send_key));
+        let recv_cipher = XSalsa20Poly1305::new(Key::from_slice(&recv_key));
+
+        let (read_half, write_half) = tokio::io::split(stream);
+
         Self {
-            stream: Mutex::new(stream),
-            send_key,
-            recv_key,
-            send_nonce: Mutex::new(0),
-            recv_nonce: Mutex::new(0),
+            reader: Mutex::new(BufReader::with_capacity(TCP_BUFFER_SIZE, read_half)),
+            writer: Mutex::new(BufWriter::with_capacity(TCP_BUFFER_SIZE, write_half)),
+            send_cipher,
+            recv_cipher,
+            send_nonce: AtomicU64::new(0),
+            recv_nonce: AtomicU64::new(0),
         }
     }
 
     pub async fn write_record(&self, plaintext: &[u8]) -> Result<()> {
-        let mut nonce_counter = self.send_nonce.lock().await;
+        let nonce_val = self.send_nonce.fetch_add(1, Ordering::Relaxed);
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        nonce_bytes[NONCE_SIZE - 8..].copy_from_slice(&nonce_counter.to_be_bytes());
-        *nonce_counter += 1;
+        nonce_bytes[NONCE_SIZE - 8..].copy_from_slice(&nonce_val.to_be_bytes());
 
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let key = Key::from_slice(&self.send_key);
-        let cipher = XSalsa20Poly1305::new(key);
 
-        let ciphertext = cipher
+        let ciphertext = self
+            .send_cipher
             .encrypt(nonce, plaintext)
             .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
 
         let total_len = (NONCE_SIZE + ciphertext.len()) as u32;
-        let mut packet = Vec::with_capacity(4 + NONCE_SIZE + ciphertext.len());
-        packet.extend_from_slice(&total_len.to_be_bytes());
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
 
-        let mut stream = self.stream.lock().await;
-        stream.write_all(&packet).await?;
+        let mut writer = self.writer.lock().await;
+        writer.write_all(&total_len.to_be_bytes()).await?;
+        writer.write_all(&nonce_bytes).await?;
+        writer.write_all(&ciphertext).await?;
 
         Ok(())
     }
 
+    pub async fn flush(&self) -> Result<()> {
+        let mut writer = self.writer.lock().await;
+        writer.flush().await?;
+        Ok(())
+    }
+
     pub async fn read_record(&self) -> Result<Vec<u8>> {
-        let mut stream = self.stream.lock().await;
+        let mut reader = self.reader.lock().await;
 
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
+        reader.read_exact(&mut len_buf).await?;
         let total_len = u32::from_be_bytes(len_buf) as usize;
 
         if total_len < NONCE_SIZE {
@@ -103,19 +114,18 @@ impl TransitConnection {
         }
 
         let mut data = vec![0u8; total_len];
-        stream.read_exact(&mut data).await?;
+        reader.read_exact(&mut data).await?;
+        drop(reader);
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let key = Key::from_slice(&self.recv_key);
-        let cipher = XSalsa20Poly1305::new(key);
 
-        let plaintext = cipher
+        let plaintext = self
+            .recv_cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow::anyhow!("Decryption failed"))?;
 
-        let mut nonce_counter = self.recv_nonce.lock().await;
-        *nonce_counter += 1;
+        self.recv_nonce.fetch_add(1, Ordering::Relaxed);
 
         Ok(plaintext)
     }
@@ -123,6 +133,11 @@ impl TransitConnection {
 
 pub async fn get_direct_hints() -> Vec<TransitHint> {
     Vec::new()
+}
+
+fn configure_stream(stream: &TcpStream) -> Result<()> {
+    stream.set_nodelay(true)?;
+    Ok(())
 }
 
 pub async fn connect_as_sender(
@@ -170,6 +185,7 @@ async fn try_connect_direct_sender(
     addr: &str,
 ) -> Result<TransitConnection> {
     let mut stream = TcpStream::connect(addr).await?;
+    configure_stream(&stream)?;
 
     let handshake = derive_transit_sender_handshake(transit_key);
     stream.write_all(&handshake).await?;
@@ -192,6 +208,7 @@ async fn try_connect_direct_receiver(
     addr: &str,
 ) -> Result<TransitConnection> {
     let mut stream = TcpStream::connect(addr).await?;
+    configure_stream(&stream)?;
 
     let expected = derive_transit_sender_handshake(transit_key);
     let mut response = vec![0u8; expected.len()];
@@ -219,6 +236,7 @@ async fn connect_via_relay_sender(
     relay_addr: &str,
 ) -> Result<TransitConnection> {
     let mut stream = TcpStream::connect(relay_addr).await?;
+    configure_stream(&stream)?;
 
     let handshake = derive_relay_handshake(transit_key);
     stream.write_all(&handshake).await?;
@@ -251,6 +269,7 @@ async fn connect_via_relay_receiver(
     relay_addr: &str,
 ) -> Result<TransitConnection> {
     let mut stream = TcpStream::connect(relay_addr).await?;
+    configure_stream(&stream)?;
 
     let handshake = derive_relay_handshake(transit_key);
     stream.write_all(&handshake).await?;
@@ -307,6 +326,8 @@ pub async fn send_file<R: AsyncRead + Unpin>(
         progress.set_position(sent);
     }
 
+    // Single flush at the end
+    conn.flush().await?;
     progress.finish_and_clear();
 
     let ack_data = conn.read_record().await?;
@@ -353,6 +374,7 @@ pub async fn receive_file<W: AsyncWrite + Unpin>(
     };
     let ack_data = serde_json::to_vec(&ack)?;
     conn.write_record(&ack_data).await?;
+    conn.flush().await?;
 
     Ok(())
 }
@@ -385,6 +407,7 @@ pub async fn receive_to_vec(
     };
     let ack_data = serde_json::to_vec(&ack)?;
     conn.write_record(&ack_data).await?;
+    conn.flush().await?;
 
     Ok(data)
 }
@@ -477,8 +500,7 @@ mod tests {
 
     #[test]
     fn test_record_size() {
-        // Ensure record size fits in encrypted packet
         assert!(RECORD_SIZE > 0);
-        assert!(RECORD_SIZE < 16384);
+        assert!(RECORD_SIZE <= 65536);
     }
 }
