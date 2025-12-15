@@ -1,6 +1,6 @@
 # wormhole-rs
 
-A Rust implementation of the Magic Wormhole protocol for secure file and text transfers.
+Rust implementation of the Magic Wormhole protocol for secure file and text transfers.
 
 [![Rust](https://github.com/liberodark/wormhole-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/liberodark/wormhole-rs/actions/workflows/rust.yml)
 

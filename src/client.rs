@@ -224,6 +224,15 @@ impl RendezvousClient {
         Ok(())
     }
 
+    async fn graceful_close(&mut self, nameplate: &str, mood: Mood) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = self.release(nameplate).await;
+            let _ = self.close(mood).await;
+            let _ = self.shutdown().await;
+        })
+        .await;
+    }
+
     async fn recv_message(&mut self) -> Result<crate::messages::Message> {
         if !self.pending_messages.is_empty() {
             return Ok(self.pending_messages.remove(0));
@@ -394,9 +403,7 @@ pub async fn send_text(
         println!("text message sent");
     }
 
-    client.release(&nameplate).await?;
-    client.close(Mood::Happy).await?;
-    client.shutdown().await?;
+    client.graceful_close(&nameplate, Mood::Happy).await;
 
     Ok(())
 }
@@ -518,9 +525,7 @@ pub async fn send_file(
 
     println!("file sent");
 
-    client.release(&nameplate).await?;
-    client.close(Mood::Happy).await?;
-    client.shutdown().await?;
+    client.graceful_close(&nameplate, Mood::Happy).await;
 
     Ok(())
 }
@@ -648,9 +653,7 @@ pub async fn send_directory(
 
     println!("directory sent");
 
-    client.release(&nameplate).await?;
-    client.close(Mood::Happy).await?;
-    client.shutdown().await?;
+    client.graceful_close(&nameplate, Mood::Happy).await;
 
     Ok(())
 }
@@ -726,9 +729,7 @@ pub async fn receive(
 
         println!("{}", text);
 
-        client.release(nameplate).await?;
-        client.close(Mood::Happy).await?;
-        client.shutdown().await?;
+        client.graceful_close(nameplate, Mood::Happy).await;
     } else if let Some(file_offer) = offer.file {
         let output_path = output_dir
             .map(|d| d.join(&file_offer.filename))
@@ -797,9 +798,7 @@ pub async fn receive(
 
         println!("Received file: {}", output_path.display());
 
-        client.release(nameplate).await?;
-        client.close(Mood::Happy).await?;
-        client.shutdown().await?;
+        client.graceful_close(nameplate, Mood::Happy).await;
     } else if let Some(dir_offer) = offer.directory {
         let output_path = output_dir
             .map(|d| d.join(&dir_offer.dirname))
@@ -868,9 +867,7 @@ pub async fn receive(
 
         println!("Received directory: {}", output_path.display());
 
-        client.release(nameplate).await?;
-        client.close(Mood::Happy).await?;
-        client.shutdown().await?;
+        client.graceful_close(nameplate, Mood::Happy).await;
     } else {
         anyhow::bail!("Unknown offer type");
     }
