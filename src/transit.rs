@@ -1,0 +1,484 @@
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Result;
+use crypto_secretbox::aead::{Aead, KeyInit};
+use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
+use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+
+use crate::crypto::{
+    KEY_SIZE, NONCE_SIZE, derive_record_key_receiver, derive_record_key_sender,
+    derive_relay_handshake, derive_transit_receiver_handshake, derive_transit_sender_handshake,
+};
+use crate::messages::{TransferAck, Transit, TransitHint};
+
+const RECORD_SIZE: usize = 16384 - 16;
+
+fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
+    if hide_progress {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .expect("valid template")
+                .progress_chars("#>-"),
+        );
+        pb
+    }
+}
+
+pub struct TransitConnection {
+    stream: Mutex<TcpStream>,
+    send_key: [u8; KEY_SIZE],
+    recv_key: [u8; KEY_SIZE],
+    send_nonce: Mutex<u64>,
+    recv_nonce: Mutex<u64>,
+}
+
+impl TransitConnection {
+    fn new(stream: TcpStream, transit_key: &[u8; KEY_SIZE], is_sender: bool) -> Self {
+        let (send_key, recv_key) = if is_sender {
+            (
+                derive_record_key_sender(transit_key),
+                derive_record_key_receiver(transit_key),
+            )
+        } else {
+            (
+                derive_record_key_receiver(transit_key),
+                derive_record_key_sender(transit_key),
+            )
+        };
+
+        Self {
+            stream: Mutex::new(stream),
+            send_key,
+            recv_key,
+            send_nonce: Mutex::new(0),
+            recv_nonce: Mutex::new(0),
+        }
+    }
+
+    pub async fn write_record(&self, plaintext: &[u8]) -> Result<()> {
+        let mut nonce_counter = self.send_nonce.lock().await;
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        nonce_bytes[NONCE_SIZE - 8..].copy_from_slice(&nonce_counter.to_be_bytes());
+        *nonce_counter += 1;
+
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let key = Key::from_slice(&self.send_key);
+        let cipher = XSalsa20Poly1305::new(key);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+
+        let total_len = (NONCE_SIZE + ciphertext.len()) as u32;
+        let mut packet = Vec::with_capacity(4 + NONCE_SIZE + ciphertext.len());
+        packet.extend_from_slice(&total_len.to_be_bytes());
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(&ciphertext);
+
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&packet).await?;
+
+        Ok(())
+    }
+
+    pub async fn read_record(&self) -> Result<Vec<u8>> {
+        let mut stream = self.stream.lock().await;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let total_len = u32::from_be_bytes(len_buf) as usize;
+
+        if total_len < NONCE_SIZE {
+            anyhow::bail!("Invalid record length");
+        }
+
+        let mut data = vec![0u8; total_len];
+        stream.read_exact(&mut data).await?;
+
+        let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let key = Key::from_slice(&self.recv_key);
+        let cipher = XSalsa20Poly1305::new(key);
+
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("Decryption failed"))?;
+
+        let mut nonce_counter = self.recv_nonce.lock().await;
+        *nonce_counter += 1;
+
+        Ok(plaintext)
+    }
+}
+
+pub async fn get_direct_hints() -> Vec<TransitHint> {
+    Vec::new()
+}
+
+pub async fn connect_as_sender(
+    transit_key: &[u8; KEY_SIZE],
+    peer_hints: &Transit,
+    relay_addr: &str,
+) -> Result<Arc<TransitConnection>> {
+    for hint in &peer_hints.hints_v1 {
+        if hint.hint_type == "direct-tcp-v1"
+            && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
+        {
+            let addr = format!("{}:{}", host, port);
+            if let Ok(conn) = try_connect_direct_sender(transit_key, &addr).await {
+                return Ok(Arc::new(conn));
+            }
+        }
+    }
+
+    let conn = connect_via_relay_sender(transit_key, relay_addr).await?;
+    Ok(Arc::new(conn))
+}
+
+pub async fn connect_as_receiver(
+    transit_key: &[u8; KEY_SIZE],
+    peer_hints: &Transit,
+    relay_addr: &str,
+) -> Result<Arc<TransitConnection>> {
+    for hint in &peer_hints.hints_v1 {
+        if hint.hint_type == "direct-tcp-v1"
+            && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
+        {
+            let addr = format!("{}:{}", host, port);
+            if let Ok(conn) = try_connect_direct_receiver(transit_key, &addr).await {
+                return Ok(Arc::new(conn));
+            }
+        }
+    }
+
+    let conn = connect_via_relay_receiver(transit_key, relay_addr).await?;
+    Ok(Arc::new(conn))
+}
+
+async fn try_connect_direct_sender(
+    transit_key: &[u8; KEY_SIZE],
+    addr: &str,
+) -> Result<TransitConnection> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let handshake = derive_transit_sender_handshake(transit_key);
+    stream.write_all(&handshake).await?;
+
+    let expected = derive_transit_receiver_handshake(transit_key);
+    let mut response = vec![0u8; expected.len()];
+    stream.read_exact(&mut response).await?;
+
+    if response != expected {
+        anyhow::bail!("Invalid receiver handshake");
+    }
+
+    stream.write_all(b"go\n").await?;
+
+    Ok(TransitConnection::new(stream, transit_key, true))
+}
+
+async fn try_connect_direct_receiver(
+    transit_key: &[u8; KEY_SIZE],
+    addr: &str,
+) -> Result<TransitConnection> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let expected = derive_transit_sender_handshake(transit_key);
+    let mut response = vec![0u8; expected.len()];
+    stream.read_exact(&mut response).await?;
+
+    if response != expected {
+        anyhow::bail!("Invalid sender handshake");
+    }
+
+    let handshake = derive_transit_receiver_handshake(transit_key);
+    stream.write_all(&handshake).await?;
+
+    let mut go_buf = [0u8; 3];
+    stream.read_exact(&mut go_buf).await?;
+
+    if &go_buf != b"go\n" {
+        anyhow::bail!("Did not receive 'go' from sender");
+    }
+
+    Ok(TransitConnection::new(stream, transit_key, false))
+}
+
+async fn connect_via_relay_sender(
+    transit_key: &[u8; KEY_SIZE],
+    relay_addr: &str,
+) -> Result<TransitConnection> {
+    let mut stream = TcpStream::connect(relay_addr).await?;
+
+    let handshake = derive_relay_handshake(transit_key);
+    stream.write_all(&handshake).await?;
+
+    let mut ok_buf = [0u8; 3];
+    stream.read_exact(&mut ok_buf).await?;
+
+    if &ok_buf != b"ok\n" {
+        anyhow::bail!("Relay did not accept connection");
+    }
+
+    let sender_handshake = derive_transit_sender_handshake(transit_key);
+    stream.write_all(&sender_handshake).await?;
+
+    let expected = derive_transit_receiver_handshake(transit_key);
+    let mut response = vec![0u8; expected.len()];
+    stream.read_exact(&mut response).await?;
+
+    if response != expected {
+        anyhow::bail!("Invalid receiver handshake via relay");
+    }
+
+    stream.write_all(b"go\n").await?;
+
+    Ok(TransitConnection::new(stream, transit_key, true))
+}
+
+async fn connect_via_relay_receiver(
+    transit_key: &[u8; KEY_SIZE],
+    relay_addr: &str,
+) -> Result<TransitConnection> {
+    let mut stream = TcpStream::connect(relay_addr).await?;
+
+    let handshake = derive_relay_handshake(transit_key);
+    stream.write_all(&handshake).await?;
+
+    let mut ok_buf = [0u8; 3];
+    stream.read_exact(&mut ok_buf).await?;
+
+    if &ok_buf != b"ok\n" {
+        anyhow::bail!("Relay did not accept connection");
+    }
+
+    let expected = derive_transit_sender_handshake(transit_key);
+    let mut response = vec![0u8; expected.len()];
+    stream.read_exact(&mut response).await?;
+
+    if response != expected {
+        anyhow::bail!("Invalid sender handshake via relay");
+    }
+
+    let receiver_handshake = derive_transit_receiver_handshake(transit_key);
+    stream.write_all(&receiver_handshake).await?;
+
+    let mut go_buf = [0u8; 3];
+    stream.read_exact(&mut go_buf).await?;
+
+    if &go_buf != b"go\n" {
+        anyhow::bail!("Did not receive 'go' from sender via relay");
+    }
+
+    Ok(TransitConnection::new(stream, transit_key, false))
+}
+
+pub async fn send_file<R: AsyncRead + Unpin>(
+    conn: &Arc<TransitConnection>,
+    reader: &mut R,
+    total_size: u64,
+    hide_progress: bool,
+) -> Result<()> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; RECORD_SIZE];
+    let mut sent = 0u64;
+
+    let progress = create_progress_bar(total_size, hide_progress);
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        hasher.update(&buf[..n]);
+        conn.write_record(&buf[..n]).await?;
+        sent += n as u64;
+        progress.set_position(sent);
+    }
+
+    progress.finish_and_clear();
+
+    let ack_data = conn.read_record().await?;
+    let ack: TransferAck = serde_json::from_slice(&ack_data)?;
+
+    if ack.ack != "ok" {
+        anyhow::bail!("Transfer not acknowledged");
+    }
+
+    let hash = hex::encode(hasher.finalize());
+    if ack.sha256.to_lowercase() != hash {
+        anyhow::bail!("SHA256 mismatch: expected {}, got {}", hash, ack.sha256);
+    }
+
+    Ok(())
+}
+
+pub async fn receive_file<W: AsyncWrite + Unpin>(
+    conn: &Arc<TransitConnection>,
+    writer: &mut W,
+    total_size: u64,
+    hide_progress: bool,
+) -> Result<()> {
+    let mut hasher = Sha256::new();
+    let mut received = 0u64;
+
+    let progress = create_progress_bar(total_size, hide_progress);
+
+    while received < total_size {
+        let data = conn.read_record().await?;
+        hasher.update(&data);
+        writer.write_all(&data).await?;
+        received += data.len() as u64;
+        progress.set_position(received);
+    }
+
+    progress.finish_and_clear();
+    writer.flush().await?;
+
+    let hash = hex::encode(hasher.finalize());
+    let ack = TransferAck {
+        ack: "ok".to_string(),
+        sha256: hash,
+    };
+    let ack_data = serde_json::to_vec(&ack)?;
+    conn.write_record(&ack_data).await?;
+
+    Ok(())
+}
+
+pub async fn receive_to_vec(
+    conn: &Arc<TransitConnection>,
+    total_size: u64,
+    hide_progress: bool,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(total_size as usize);
+    let mut hasher = Sha256::new();
+    let mut received = 0u64;
+
+    let progress = create_progress_bar(total_size, hide_progress);
+
+    while received < total_size {
+        let chunk = conn.read_record().await?;
+        hasher.update(&chunk);
+        data.extend_from_slice(&chunk);
+        received += chunk.len() as u64;
+        progress.set_position(received);
+    }
+
+    progress.finish_and_clear();
+
+    let hash = hex::encode(hasher.finalize());
+    let ack = TransferAck {
+        ack: "ok".to_string(),
+        sha256: hash,
+    };
+    let ack_data = serde_json::to_vec(&ack)?;
+    conn.write_record(&ack_data).await?;
+
+    Ok(data)
+}
+
+pub async fn create_zip(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
+    use std::io::Cursor;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut buffer = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut buffer);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut num_files = 0u64;
+    let mut num_bytes = 0u64;
+
+    fn add_dir_to_zip<W: Write + std::io::Seek>(
+        zip: &mut ZipWriter<W>,
+        path: &Path,
+        prefix: &Path,
+        options: SimpleFileOptions,
+        num_files: &mut u64,
+        num_bytes: &mut u64,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let name = entry_path.strip_prefix(prefix)?.to_string_lossy();
+
+            if entry_path.is_dir() {
+                zip.add_directory(format!("{}/", name), options)?;
+                add_dir_to_zip(zip, &entry_path, prefix, options, num_files, num_bytes)?;
+            } else if entry_path.is_file() {
+                zip.start_file(name.to_string(), options)?;
+                let data = std::fs::read(&entry_path)?;
+                *num_bytes += data.len() as u64;
+                *num_files += 1;
+                zip.write_all(&data)?;
+            }
+        }
+        Ok(())
+    }
+
+    let prefix = path.parent().unwrap_or(path);
+    add_dir_to_zip(
+        &mut zip,
+        path,
+        prefix,
+        options,
+        &mut num_files,
+        &mut num_bytes,
+    )?;
+
+    zip.finish()?;
+    let data = buffer.into_inner();
+
+    Ok((data, num_files, num_bytes))
+}
+
+pub async fn extract_zip(data: &[u8], output_path: &Path) -> Result<()> {
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor)?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let outpath = output_path.join(file.name());
+
+        if file.name().ends_with('/') {
+            tokio::fs::create_dir_all(&outpath).await?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            let mut outfile = tokio::fs::File::create(&outpath).await?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            outfile.write_all(&data).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_size() {
+        // Ensure record size fits in encrypted packet
+        assert!(RECORD_SIZE > 0);
+        assert!(RECORD_SIZE < 16384);
+    }
+}
