@@ -130,11 +130,8 @@ fn print_completions<G: clap_complete::Generator>(generator: G, cmd: &mut clap::
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.command {
+async fn run_command(command: Commands) -> Result<()> {
+    match command {
         Commands::Send {
             path,
             text,
@@ -247,4 +244,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+
+    let result = tokio::select! {
+        biased;
+
+        result = run_command(cli.command) => result,
+
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nInterrupted");
+            transit::cleanup_temp_file();
+            std::process::exit(130);
+        }
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

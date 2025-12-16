@@ -27,6 +27,29 @@ const ZSTD_LEVEL: i32 = 3; // Fast compression
 const MEMORY_SAFETY_FACTOR: f64 = 0.5;
 const MIN_AVAILABLE_RAM: u64 = 256 * 1024 * 1024;
 
+static CURRENT_TEMP_FILE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn register_temp_file(path: &Path) {
+    if let Ok(mut guard) = CURRENT_TEMP_FILE.lock() {
+        *guard = Some(path.to_path_buf());
+    }
+}
+
+fn unregister_temp_file() {
+    if let Ok(mut guard) = CURRENT_TEMP_FILE.lock() {
+        *guard = None;
+    }
+}
+
+pub fn cleanup_temp_file() {
+    if let Ok(mut guard) = CURRENT_TEMP_FILE.lock()
+        && let Some(path) = guard.take()
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Compression {
     #[default]
@@ -800,6 +823,7 @@ pub async fn receive_to_tempfile(
     use tokio::io::AsyncWriteExt;
 
     let temp_file = tempfile::NamedTempFile::new()?;
+    register_temp_file(temp_file.path());
     let mut file = tokio::fs::File::create(temp_file.path()).await?;
     let mut hasher = Sha256::new();
     let mut received = 0u64;
@@ -826,6 +850,7 @@ pub async fn receive_to_tempfile(
     conn.write_record(&ack_data).await?;
     conn.flush().await?;
 
+    unregister_temp_file();
     Ok(temp_file)
 }
 
@@ -869,11 +894,13 @@ fn compress_file_to_tempfile_sync(path: &Path) -> Result<tempfile::NamedTempFile
     let mut reader = BufReader::new(input);
 
     let temp_file = tempfile::NamedTempFile::new()?;
+    register_temp_file(temp_file.path());
     let mut encoder = zstd::Encoder::new(temp_file.reopen()?, ZSTD_LEVEL)?;
 
     std::io::copy(&mut reader, &mut encoder)?;
     encoder.finish()?;
 
+    unregister_temp_file();
     Ok(temp_file)
 }
 
@@ -1022,6 +1049,7 @@ fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, 
     use zip::write::SimpleFileOptions;
 
     let temp_file = tempfile::NamedTempFile::new()?;
+    register_temp_file(temp_file.path());
     let mut zip = ZipWriter::new(BufWriter::new(temp_file.reopen()?));
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -1073,6 +1101,7 @@ fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, 
 
     zip.finish()?;
 
+    unregister_temp_file();
     Ok((temp_file, num_files, num_bytes))
 }
 
@@ -1152,6 +1181,7 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
 
     // Create temporary file for the compressed output
     let temp_file = tempfile::NamedTempFile::new()?;
+    register_temp_file(temp_file.path());
     let zstd_writer = zstd::Encoder::new(BufWriter::new(temp_file.reopen()?), ZSTD_LEVEL)?;
     let mut tar_builder = tar::Builder::new(zstd_writer);
 
@@ -1207,6 +1237,7 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
     let zstd_writer = tar_builder.into_inner()?;
     zstd_writer.finish()?;
 
+    unregister_temp_file();
     Ok((temp_file, num_files, num_bytes))
 }
 
