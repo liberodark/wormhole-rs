@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use indicatif::{ProgressBar, ProgressStyle};
+use ring::aead::{self, CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use sha2::{Digest, Sha256};
 use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -15,17 +16,70 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::crypto::{
-    KEY_SIZE, NONCE_SIZE, derive_record_key_receiver, derive_record_key_sender,
-    derive_relay_handshake, derive_transit_receiver_handshake, derive_transit_sender_handshake,
+    KEY_SIZE, derive_record_key_receiver, derive_record_key_sender, derive_relay_handshake,
+    derive_transit_receiver_handshake, derive_transit_sender_handshake,
 };
 use crate::messages::{TransferAck, Transit, TransitHint};
 
-const RECORD_SIZE: usize = 65536 - 16; // 64KB
+const RECORD_SIZE: usize = 262144 - 16; // 256KB
 const TCP_BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
 const ZSTD_LEVEL: i32 = 3; // Fast compression
 
 const MEMORY_SAFETY_FACTOR: f64 = 0.5;
 const MIN_AVAILABLE_RAM: u64 = 256 * 1024 * 1024;
+const XSALSA20_NONCE_SIZE: usize = 24;
+const CHACHA20_NONCE_SIZE: usize = 12;
+
+/// Cipher mode for transit encryption
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CipherMode {
+    #[default]
+    /// XSalsa20-Poly1305 + SHA256 (compatible with Python client)
+    Compat,
+    /// Ring ChaCha20-Poly1305 + BLAKE3 (faster, wormhole-rs only)
+    Fast,
+}
+
+impl CipherMode {
+    fn nonce_size(self) -> usize {
+        match self {
+            CipherMode::Compat => XSALSA20_NONCE_SIZE,
+            CipherMode::Fast => CHACHA20_NONCE_SIZE,
+        }
+    }
+}
+
+enum Hasher {
+    Sha256(Sha256),
+    Blake3(Box<blake3::Hasher>),
+}
+
+impl Hasher {
+    fn new(mode: CipherMode) -> Self {
+        match mode {
+            CipherMode::Compat => Hasher::Sha256(Sha256::new()),
+            CipherMode::Fast => Hasher::Blake3(Box::new(blake3::Hasher::new())),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Hasher::Sha256(h) => {
+                h.update(data);
+            }
+            Hasher::Blake3(h) => {
+                h.update(data);
+            }
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Hasher::Sha256(h) => hex::encode(h.finalize()),
+            Hasher::Blake3(h) => h.finalize().to_hex().to_string(),
+        }
+    }
+}
 
 static CURRENT_TEMP_FILE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
@@ -156,17 +210,71 @@ fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
     }
 }
 
+/// Cipher enum for either compat (XSalsa20) or fast (Ring ChaCha20) mode
+enum Cipher {
+    Compat(XSalsa20Poly1305),
+    Fast(Box<LessSafeKey>),
+}
+
+impl Cipher {
+    fn encrypt(&self, nonce_bytes: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Cipher::Compat(c) => {
+                let nonce = Nonce::from_slice(nonce_bytes);
+                c.encrypt(nonce, plaintext)
+                    .map_err(|_| anyhow::anyhow!("Encryption failed"))
+            }
+            Cipher::Fast(c) => {
+                let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)
+                    .map_err(|_| anyhow::anyhow!("Invalid nonce size for ChaCha20-Poly1305"))?;
+                let mut buffer = plaintext.to_vec();
+                buffer.reserve(16); // Tag size
+                c.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut buffer)
+                    .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+                Ok(buffer)
+            }
+        }
+    }
+
+    fn decrypt(&self, nonce_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Cipher::Compat(c) => {
+                let nonce = Nonce::from_slice(nonce_bytes);
+                c.decrypt(nonce, ciphertext)
+                    .map_err(|_| anyhow::anyhow!("Decryption failed"))
+            }
+            Cipher::Fast(c) => {
+                let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)
+                    .map_err(|_| anyhow::anyhow!("Invalid nonce size for ChaCha20-Poly1305"))?;
+                let mut buffer = ciphertext.to_vec();
+                let plaintext = c
+                    .open_in_place(nonce, aead::Aad::empty(), &mut buffer)
+                    .map_err(|_| anyhow::anyhow!("Decryption failed"))?;
+                let len = plaintext.len();
+                buffer.truncate(len);
+                Ok(buffer)
+            }
+        }
+    }
+}
+
 pub struct TransitConnection {
     reader: Mutex<BufReader<tokio::io::ReadHalf<TcpStream>>>,
     writer: Mutex<BufWriter<tokio::io::WriteHalf<TcpStream>>>,
-    send_cipher: XSalsa20Poly1305,
-    recv_cipher: XSalsa20Poly1305,
+    send_cipher: Cipher,
+    recv_cipher: Cipher,
     send_nonce: AtomicU64,
     recv_nonce: AtomicU64,
+    cipher_mode: CipherMode,
 }
 
 impl TransitConnection {
-    fn new(stream: TcpStream, transit_key: &[u8; KEY_SIZE], is_sender: bool) -> Self {
+    fn new(
+        stream: TcpStream,
+        transit_key: &[u8; KEY_SIZE],
+        is_sender: bool,
+        cipher_mode: CipherMode,
+    ) -> Self {
         let (send_key, recv_key) = if is_sender {
             (
                 derive_record_key_sender(transit_key),
@@ -179,8 +287,20 @@ impl TransitConnection {
             )
         };
 
-        let send_cipher = XSalsa20Poly1305::new(Key::from_slice(&send_key));
-        let recv_cipher = XSalsa20Poly1305::new(Key::from_slice(&recv_key));
+        let (send_cipher, recv_cipher) = match cipher_mode {
+            CipherMode::Compat => (
+                Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&send_key))),
+                Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&recv_key))),
+            ),
+            CipherMode::Fast => (
+                Cipher::Fast(Box::new(LessSafeKey::new(
+                    UnboundKey::new(&CHACHA20_POLY1305, &send_key).expect("valid key"),
+                ))),
+                Cipher::Fast(Box::new(LessSafeKey::new(
+                    UnboundKey::new(&CHACHA20_POLY1305, &recv_key).expect("valid key"),
+                ))),
+            ),
+        };
 
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -191,22 +311,26 @@ impl TransitConnection {
             recv_cipher,
             send_nonce: AtomicU64::new(0),
             recv_nonce: AtomicU64::new(0),
+            cipher_mode,
         }
     }
 
+    pub fn cipher_mode(&self) -> CipherMode {
+        self.cipher_mode
+    }
+
     pub async fn write_record(&self, plaintext: &[u8]) -> Result<()> {
+        let nonce_size = self.cipher_mode.nonce_size();
         let nonce_val = self.send_nonce.fetch_add(1, Ordering::Relaxed);
-        let mut nonce_bytes = [0u8; NONCE_SIZE];
-        nonce_bytes[NONCE_SIZE - 8..].copy_from_slice(&nonce_val.to_be_bytes());
 
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        // Create nonce with appropriate size
+        let mut nonce_bytes = vec![0u8; nonce_size];
+        let offset = nonce_size.saturating_sub(8);
+        nonce_bytes[offset..].copy_from_slice(&nonce_val.to_be_bytes()[..nonce_size.min(8)]);
 
-        let ciphertext = self
-            .send_cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+        let ciphertext = self.send_cipher.encrypt(&nonce_bytes, plaintext)?;
 
-        let total_len = (NONCE_SIZE + ciphertext.len()) as u32;
+        let total_len = (nonce_size + ciphertext.len()) as u32;
 
         let mut writer = self.writer.lock().await;
         writer.write_all(&total_len.to_be_bytes()).await?;
@@ -223,27 +347,30 @@ impl TransitConnection {
     }
 
     pub async fn read_record(&self) -> Result<Vec<u8>> {
+        let nonce_size = self.cipher_mode.nonce_size();
         let mut reader = self.reader.lock().await;
 
+        // Read length
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let total_len = u32::from_be_bytes(len_buf) as usize;
 
-        if total_len < NONCE_SIZE {
+        if total_len < nonce_size + 16 {
             anyhow::bail!("Invalid record length");
         }
 
-        let mut data = vec![0u8; total_len];
-        reader.read_exact(&mut data).await?;
+        // Read nonce
+        let mut nonce_bytes = vec![0u8; nonce_size];
+        reader.read_exact(&mut nonce_bytes).await?;
+
+        // Read ciphertext + tag
+        let ciphertext_len = total_len - nonce_size;
+        let mut ciphertext = vec![0u8; ciphertext_len];
+        reader.read_exact(&mut ciphertext).await?;
         drop(reader);
 
-        let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        let plaintext = self
-            .recv_cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("Decryption failed"))?;
+        // Decrypt
+        let plaintext = self.recv_cipher.decrypt(&nonce_bytes, &ciphertext)?;
 
         self.recv_nonce.fetch_add(1, Ordering::Relaxed);
 
@@ -309,16 +436,17 @@ impl DirectListener {
     }
 
     /// Accept a connection and perform sender handshake
-    /// Called when we are the SENDER and RECEIVER connects to us
-    pub async fn accept_as_sender(self, transit_key: &[u8; KEY_SIZE]) -> Result<TransitConnection> {
+    pub async fn accept_as_sender(
+        self,
+        transit_key: &[u8; KEY_SIZE],
+        cipher_mode: CipherMode,
+    ) -> Result<TransitConnection> {
         let (mut stream, _addr) = self.listener.accept().await?;
         configure_stream(&stream)?;
 
-        // We are the SENDER, so send sender handshake first
         let handshake = derive_transit_sender_handshake(transit_key);
         stream.write_all(&handshake).await?;
 
-        // Wait for receiver handshake
         let expected = derive_transit_receiver_handshake(transit_key);
         let mut response = vec![0u8; expected.len()];
         stream.read_exact(&mut response).await?;
@@ -327,22 +455,25 @@ impl DirectListener {
             anyhow::bail!("Invalid receiver handshake on direct connection");
         }
 
-        // Send "go"
         stream.write_all(b"go\n").await?;
 
-        Ok(TransitConnection::new(stream, transit_key, true))
+        Ok(TransitConnection::new(
+            stream,
+            transit_key,
+            true,
+            cipher_mode,
+        ))
     }
 
     /// Accept a connection and perform receiver handshake
-    /// Called when we are the RECEIVER and SENDER connects to us
     pub async fn accept_as_receiver(
         self,
         transit_key: &[u8; KEY_SIZE],
+        cipher_mode: CipherMode,
     ) -> Result<TransitConnection> {
         let (mut stream, _addr) = self.listener.accept().await?;
         configure_stream(&stream)?;
 
-        // Wait for sender handshake from connecting SENDER
         let expected = derive_transit_sender_handshake(transit_key);
         let mut response = vec![0u8; expected.len()];
         stream.read_exact(&mut response).await?;
@@ -351,18 +482,21 @@ impl DirectListener {
             anyhow::bail!("Invalid sender handshake on direct connection");
         }
 
-        // We are the RECEIVER, send receiver handshake
         let handshake = derive_transit_receiver_handshake(transit_key);
         stream.write_all(&handshake).await?;
 
-        // Wait for "go"
         let mut go_buf = [0u8; 3];
         stream.read_exact(&mut go_buf).await?;
         if &go_buf != b"go\n" {
             anyhow::bail!("Did not receive 'go' on direct connection");
         }
 
-        Ok(TransitConnection::new(stream, transit_key, false))
+        Ok(TransitConnection::new(
+            stream,
+            transit_key,
+            false,
+            cipher_mode,
+        ))
     }
 }
 
@@ -382,11 +516,9 @@ pub async fn connect_as_sender(
     relay_addr: &str,
     timeout: Duration,
     listener: Option<DirectListener>,
+    cipher_mode: CipherMode,
 ) -> Result<Arc<TransitConnection>> {
-    use tokio::sync::oneshot;
-
-    let (done_tx, done_rx) = oneshot::channel::<()>();
-    let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TransitConnection>(1);
 
     // Collect direct addresses from peer hints
     let direct_addrs: Vec<String> = peer_hints
@@ -403,75 +535,51 @@ pub async fn connect_as_sender(
         .collect();
 
     // Task 1: Accept on our listener (peer connects to us)
-    let listener_task = {
+    if let Some(listener) = listener {
+        let tx = tx.clone();
         let transit_key = *transit_key;
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            if let Some(listener) = listener {
-                let result = listener.accept_as_sender(&transit_key).await;
-                if result.is_ok()
-                    && let Some(tx) = done_tx.lock().unwrap().take()
-                {
-                    let _ = tx.send(());
-                }
-                result
-            } else {
-                // No listener, this task never completes
-                std::future::pending().await
+        tokio::spawn(async move {
+            if let Ok(conn) = listener.accept_as_sender(&transit_key, cipher_mode).await {
+                let _ = tx.send(conn).await;
             }
-        }
-    };
+        });
+    }
 
     // Task 2: Connect to peer's direct hints
-    let direct_task = {
+    for addr in direct_addrs {
+        let tx = tx.clone();
         let transit_key = *transit_key;
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            for addr in direct_addrs {
-                if let Ok(conn) = try_connect_direct_sender(&transit_key, &addr, timeout).await {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
-                    return Ok(conn);
-                }
+        tokio::spawn(async move {
+            if let Ok(conn) =
+                try_connect_direct_sender(&transit_key, &addr, timeout, cipher_mode).await
+            {
+                let _ = tx.send(conn).await;
             }
-            Err(anyhow::anyhow!("All direct connections failed"))
-        }
-    };
+        });
+    }
 
-    // Task 3: Connect via relay (fallback)
-    let relay_task = {
+    // Task 3: Connect via relay (with delay to prefer direct)
+    {
+        let tx = tx.clone();
         let transit_key = *transit_key;
         let relay_addr = relay_addr.to_string();
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            // Small delay to prefer direct connections
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let result = connect_via_relay_sender(&transit_key, &relay_addr, timeout).await;
-            if result.is_ok()
-                && let Some(tx) = done_tx.lock().unwrap().take()
+            if let Ok(conn) =
+                connect_via_relay_sender(&transit_key, &relay_addr, timeout, cipher_mode).await
             {
-                let _ = tx.send(());
+                let _ = tx.send(conn).await;
             }
-            result
-        }
-    };
+        });
+    }
 
-    // Race all tasks with overall timeout
-    let result = tokio::time::timeout(timeout, async {
-        tokio::select! {
-            biased;
+    drop(tx); // Drop our copy so rx.recv() returns None when all tasks finish
 
-            result = listener_task => result,
-            result = direct_task => result,
-            result = relay_task => result,
-            _ = done_rx => Err(anyhow::anyhow!("Connection established elsewhere")),
-        }
-    })
-    .await
-    .context("Transit connection timed out")?;
-
-    result.map(Arc::new)
+    tokio::time::timeout(timeout, rx.recv())
+        .await
+        .context("Transit connection timed out")?
+        .context("All connection attempts failed")
+        .map(Arc::new)
 }
 
 pub async fn connect_as_receiver(
@@ -480,12 +588,11 @@ pub async fn connect_as_receiver(
     relay_addr: &str,
     timeout: Duration,
     listener: Option<DirectListener>,
+    cipher_mode: CipherMode,
 ) -> Result<Arc<TransitConnection>> {
-    use tokio::sync::oneshot;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TransitConnection>(1);
 
-    let (done_tx, done_rx) = oneshot::channel::<()>();
-    let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
-
+    // Collect direct addresses from peer hints
     let direct_addrs: Vec<String> = peer_hints
         .hints_v1
         .iter()
@@ -499,77 +606,59 @@ pub async fn connect_as_receiver(
         })
         .collect();
 
-    let listener_task = {
+    // Task 1: Accept on our listener (peer connects to us)
+    if let Some(listener) = listener {
+        let tx = tx.clone();
         let transit_key = *transit_key;
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            if let Some(listener) = listener {
-                let result = listener.accept_as_receiver(&transit_key).await;
-                if result.is_ok()
-                    && let Some(tx) = done_tx.lock().unwrap().take()
-                {
-                    let _ = tx.send(());
-                }
-                result
-            } else {
-                std::future::pending().await
+        tokio::spawn(async move {
+            if let Ok(conn) = listener.accept_as_receiver(&transit_key, cipher_mode).await {
+                let _ = tx.send(conn).await;
             }
-        }
-    };
+        });
+    }
 
-    let direct_task = {
+    // Task 2: Connect to peer's direct hints
+    for addr in direct_addrs {
+        let tx = tx.clone();
         let transit_key = *transit_key;
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            for addr in direct_addrs {
-                if let Ok(conn) = try_connect_direct_receiver(&transit_key, &addr, timeout).await {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
-                    return Ok(conn);
-                }
+        tokio::spawn(async move {
+            if let Ok(conn) =
+                try_connect_direct_receiver(&transit_key, &addr, timeout, cipher_mode).await
+            {
+                let _ = tx.send(conn).await;
             }
-            Err(anyhow::anyhow!("All direct connections failed"))
-        }
-    };
+        });
+    }
 
-    let relay_task = {
+    // Task 3: Connect via relay (with delay to prefer direct)
+    {
+        let tx = tx.clone();
         let transit_key = *transit_key;
         let relay_addr = relay_addr.to_string();
-        let done_tx = Arc::clone(&done_tx);
-        async move {
-            // Small delay to prefer direct connections
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let result = connect_via_relay_receiver(&transit_key, &relay_addr, timeout).await;
-            if result.is_ok()
-                && let Some(tx) = done_tx.lock().unwrap().take()
+            if let Ok(conn) =
+                connect_via_relay_receiver(&transit_key, &relay_addr, timeout, cipher_mode).await
             {
-                let _ = tx.send(());
+                let _ = tx.send(conn).await;
             }
-            result
-        }
-    };
+        });
+    }
 
-    let result = tokio::time::timeout(timeout, async {
-        tokio::select! {
-            biased;
+    drop(tx);
 
-            result = listener_task => result,
-            result = direct_task => result,
-            result = relay_task => result,
-            _ = done_rx => Err(anyhow::anyhow!("Connection established elsewhere")),
-        }
-    })
-    .await
-    .context("Transit connection timed out")?;
-
-    result.map(Arc::new)
+    tokio::time::timeout(timeout, rx.recv())
+        .await
+        .context("Transit connection timed out")?
+        .context("All connection attempts failed")
+        .map(Arc::new)
 }
 
 async fn try_connect_direct_sender(
     transit_key: &[u8; KEY_SIZE],
     addr: &str,
     timeout: Duration,
+    cipher_mode: CipherMode,
 ) -> Result<TransitConnection> {
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
         .await
@@ -590,13 +679,19 @@ async fn try_connect_direct_sender(
 
     stream.write_all(b"go\n").await?;
 
-    Ok(TransitConnection::new(stream, transit_key, true))
+    Ok(TransitConnection::new(
+        stream,
+        transit_key,
+        true,
+        cipher_mode,
+    ))
 }
 
 async fn try_connect_direct_receiver(
     transit_key: &[u8; KEY_SIZE],
     addr: &str,
     timeout: Duration,
+    cipher_mode: CipherMode,
 ) -> Result<TransitConnection> {
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
         .await
@@ -622,13 +717,19 @@ async fn try_connect_direct_receiver(
         anyhow::bail!("Did not receive 'go' from sender");
     }
 
-    Ok(TransitConnection::new(stream, transit_key, false))
+    Ok(TransitConnection::new(
+        stream,
+        transit_key,
+        false,
+        cipher_mode,
+    ))
 }
 
 async fn connect_via_relay_sender(
     transit_key: &[u8; KEY_SIZE],
     relay_addr: &str,
     timeout: Duration,
+    cipher_mode: CipherMode,
 ) -> Result<TransitConnection> {
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(relay_addr))
         .await
@@ -659,13 +760,19 @@ async fn connect_via_relay_sender(
 
     stream.write_all(b"go\n").await?;
 
-    Ok(TransitConnection::new(stream, transit_key, true))
+    Ok(TransitConnection::new(
+        stream,
+        transit_key,
+        true,
+        cipher_mode,
+    ))
 }
 
 async fn connect_via_relay_receiver(
     transit_key: &[u8; KEY_SIZE],
     relay_addr: &str,
     timeout: Duration,
+    cipher_mode: CipherMode,
 ) -> Result<TransitConnection> {
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(relay_addr))
         .await
@@ -701,7 +808,12 @@ async fn connect_via_relay_receiver(
         anyhow::bail!("Did not receive 'go' from sender via relay");
     }
 
-    Ok(TransitConnection::new(stream, transit_key, false))
+    Ok(TransitConnection::new(
+        stream,
+        transit_key,
+        false,
+        cipher_mode,
+    ))
 }
 
 pub async fn send_file<R: AsyncRead + Unpin>(
@@ -710,7 +822,7 @@ pub async fn send_file<R: AsyncRead + Unpin>(
     total_size: u64,
     hide_progress: bool,
 ) -> Result<()> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new(conn.cipher_mode());
     let mut buf = vec![0u8; RECORD_SIZE];
     let mut sent = 0u64;
 
@@ -739,9 +851,9 @@ pub async fn send_file<R: AsyncRead + Unpin>(
         anyhow::bail!("Transfer not acknowledged");
     }
 
-    let hash = hex::encode(hasher.finalize());
-    if ack.sha256.to_lowercase() != hash {
-        anyhow::bail!("SHA256 mismatch: expected {}, got {}", hash, ack.sha256);
+    let hash = hasher.finalize_hex();
+    if ack.sha256.to_lowercase() != hash.to_lowercase() {
+        anyhow::bail!("Hash mismatch: expected {}, got {}", hash, ack.sha256);
     }
 
     Ok(())
@@ -753,7 +865,7 @@ pub async fn receive_file<W: AsyncWrite + Unpin>(
     total_size: u64,
     hide_progress: bool,
 ) -> Result<()> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new(conn.cipher_mode());
     let mut received = 0u64;
 
     let progress = create_progress_bar(total_size, hide_progress);
@@ -769,7 +881,7 @@ pub async fn receive_file<W: AsyncWrite + Unpin>(
     progress.finish_and_clear();
     writer.flush().await?;
 
-    let hash = hex::encode(hasher.finalize());
+    let hash = hasher.finalize_hex();
     let ack = TransferAck {
         ack: "ok".to_string(),
         sha256: hash,
@@ -787,7 +899,7 @@ pub async fn receive_to_vec(
     hide_progress: bool,
 ) -> Result<Vec<u8>> {
     let mut data = Vec::with_capacity(total_size as usize);
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new(conn.cipher_mode());
     let mut received = 0u64;
 
     let progress = create_progress_bar(total_size, hide_progress);
@@ -802,7 +914,7 @@ pub async fn receive_to_vec(
 
     progress.finish_and_clear();
 
-    let hash = hex::encode(hasher.finalize());
+    let hash = hasher.finalize_hex();
     let ack = TransferAck {
         ack: "ok".to_string(),
         sha256: hash,
@@ -825,7 +937,7 @@ pub async fn receive_to_tempfile(
     let temp_file = tempfile::NamedTempFile::new()?;
     register_temp_file(temp_file.path());
     let mut file = tokio::fs::File::create(temp_file.path()).await?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new(conn.cipher_mode());
     let mut received = 0u64;
 
     let progress = create_progress_bar(total_size, hide_progress);
@@ -841,7 +953,7 @@ pub async fn receive_to_tempfile(
     file.flush().await?;
     progress.finish_and_clear();
 
-    let hash = hex::encode(hasher.finalize());
+    let hash = hasher.finalize_hex();
     let ack = TransferAck {
         ack: "ok".to_string(),
         sha256: hash,
@@ -1165,8 +1277,6 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     add_dir_contents(&mut tar_builder, path, path, &mut num_files, &mut num_bytes)?;
 
     let tar_data = tar_builder.into_inner()?.into_inner();
-
-    // Compress with zstd
     let compressed = zstd::encode_all(std::io::Cursor::new(&tar_data), ZSTD_LEVEL)?;
 
     Ok((compressed, num_files, num_bytes))
@@ -1466,7 +1576,7 @@ mod tests {
     #[test]
     fn test_record_size() {
         assert!(RECORD_SIZE > 0);
-        assert!(RECORD_SIZE <= 65536);
+        assert!(RECORD_SIZE <= 262144);
     }
 
     #[test]
@@ -1480,6 +1590,84 @@ mod tests {
         assert_eq!(Compression::from_mode("zipfile/deflated"), Compression::Zip);
         assert_eq!(Compression::from_mode("tarball/zstd"), Compression::Zstd);
         assert_eq!(Compression::from_mode("unknown"), Compression::Zip);
+    }
+
+    #[test]
+    fn test_cipher_mode_nonce_size() {
+        assert_eq!(CipherMode::Compat.nonce_size(), 24);
+        assert_eq!(CipherMode::Fast.nonce_size(), 12);
+    }
+
+    #[test]
+    fn test_cipher_roundtrip_compat() {
+        use crypto_secretbox::aead::KeyInit;
+        use crypto_secretbox::{Key, XSalsa20Poly1305};
+
+        let key = [42u8; KEY_SIZE];
+        let cipher = Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&key)));
+
+        let plaintext = b"Hello, World!";
+        let nonce = [0u8; XSALSA20_NONCE_SIZE]; // 24 bytes
+
+        let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
+        let decrypted = cipher.decrypt(&nonce, &ciphertext).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cipher_roundtrip_fast() {
+        use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
+
+        let key = [42u8; KEY_SIZE];
+        let cipher = Cipher::Fast(Box::new(LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &key).unwrap(),
+        )));
+
+        let plaintext = b"Hello, World!";
+        let nonce = [0u8; CHACHA20_NONCE_SIZE]; // 12 bytes
+
+        let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
+        let decrypted = cipher.decrypt(&nonce, &ciphertext).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cipher_different_nonces_produce_different_ciphertext() {
+        use crypto_secretbox::aead::KeyInit;
+        use crypto_secretbox::{Key, XSalsa20Poly1305};
+
+        let key = [42u8; KEY_SIZE];
+        let cipher = Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&key)));
+
+        let plaintext = b"Hello, World!";
+        let nonce1 = [0u8; XSALSA20_NONCE_SIZE];
+        let nonce2 = [1u8; XSALSA20_NONCE_SIZE];
+
+        let ciphertext1 = cipher.encrypt(&nonce1, plaintext).unwrap();
+        let ciphertext2 = cipher.encrypt(&nonce2, plaintext).unwrap();
+
+        assert_ne!(ciphertext1, ciphertext2);
+    }
+
+    #[test]
+    fn test_cipher_wrong_key_fails_decryption() {
+        use crypto_secretbox::aead::KeyInit;
+        use crypto_secretbox::{Key, XSalsa20Poly1305};
+
+        let key1 = [42u8; KEY_SIZE];
+        let key2 = [43u8; KEY_SIZE];
+        let cipher1 = Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&key1)));
+        let cipher2 = Cipher::Compat(XSalsa20Poly1305::new(Key::from_slice(&key2)));
+
+        let plaintext = b"Hello, World!";
+        let nonce = [0u8; XSALSA20_NONCE_SIZE];
+
+        let ciphertext = cipher1.encrypt(&nonce, plaintext).unwrap();
+        let result = cipher2.decrypt(&nonce, &ciphertext);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1542,5 +1730,21 @@ mod tests {
 
         let result = compress_file(&file_path).await.unwrap();
         assert!(matches!(result, CompressedFile::Memory(_)));
+    }
+
+    #[test]
+    fn test_hasher_sha256() {
+        let mut hasher = Hasher::new(CipherMode::Compat);
+        hasher.update(b"hello");
+        let hash = hasher.finalize_hex();
+        assert_eq!(hash.len(), 64); // SHA256 = 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn test_hasher_blake3() {
+        let mut hasher = Hasher::new(CipherMode::Fast);
+        hasher.update(b"hello");
+        let hash = hasher.finalize_hex();
+        assert_eq!(hash.len(), 64); // BLAKE3 = 32 bytes = 64 hex chars
     }
 }

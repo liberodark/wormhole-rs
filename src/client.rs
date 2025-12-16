@@ -32,6 +32,7 @@ pub struct SendConfig<'a> {
     pub compression: transit::Compression,
     pub connect_timeout: Duration,
     pub peer_timeout: Duration,
+    pub fast: bool,
 }
 
 impl Default for SendConfig<'_> {
@@ -46,6 +47,7 @@ impl Default for SendConfig<'_> {
             compression: transit::Compression::Zip,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             peer_timeout: DEFAULT_PEER_TIMEOUT,
+            fast: false,
         }
     }
 }
@@ -59,6 +61,7 @@ pub struct ReceiveConfig<'a> {
     pub auto_accept: bool,
     pub connect_timeout: Duration,
     pub peer_timeout: Duration,
+    pub fast: bool,
 }
 
 impl Default for ReceiveConfig<'_> {
@@ -72,6 +75,7 @@ impl Default for ReceiveConfig<'_> {
             auto_accept: false,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             peer_timeout: DEFAULT_PEER_TIMEOUT,
+            fast: false,
         }
     }
 }
@@ -754,12 +758,18 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     .await?;
 
     let peer_transit = wait_for_transit_ack(&mut client, &shared_key, config.peer_timeout).await?;
+    let cipher_mode = if config.fast {
+        transit::CipherMode::Fast
+    } else {
+        transit::CipherMode::Compat
+    };
     let conn = transit::connect_as_sender(
         &transit_key,
         &peer_transit,
         config.transit_relay,
         config.connect_timeout,
         listener,
+        cipher_mode,
     )
     .await?;
 
@@ -827,12 +837,18 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
     .await?;
 
     let peer_transit = wait_for_transit_ack(&mut client, &shared_key, config.peer_timeout).await?;
+    let cipher_mode = if config.fast {
+        transit::CipherMode::Fast
+    } else {
+        transit::CipherMode::Compat
+    };
     let conn = transit::connect_as_sender(
         &transit_key,
         &peer_transit,
         config.transit_relay,
         config.connect_timeout,
         listener,
+        cipher_mode,
     )
     .await?;
 
@@ -956,12 +972,18 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
+        let cipher_mode = if config.fast {
+            transit::CipherMode::Fast
+        } else {
+            transit::CipherMode::Compat
+        };
         let conn = transit::connect_as_receiver(
             &transit_key,
             &peer_transit,
             config.transit_relay,
             config.connect_timeout,
             listener,
+            cipher_mode,
         )
         .await?;
 
@@ -1016,12 +1038,18 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
+        let cipher_mode = if config.fast {
+            transit::CipherMode::Fast
+        } else {
+            transit::CipherMode::Compat
+        };
         let conn = transit::connect_as_receiver(
             &transit_key,
             &peer_transit,
             config.transit_relay,
             config.connect_timeout,
             listener,
+            cipher_mode,
         )
         .await?;
 

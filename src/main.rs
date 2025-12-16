@@ -67,6 +67,10 @@ enum Commands {
 
         #[arg(long, default_value = "300")]
         peer_timeout: u64,
+
+        /// Use fast cipher (ChaCha20-Poly1305, incompatible with Python client)
+        #[arg(long)]
+        fast: bool,
     },
 
     #[command(visible_alias = "recv")]
@@ -97,6 +101,10 @@ enum Commands {
 
         #[arg(long, default_value = "300")]
         peer_timeout: u64,
+
+        /// Use fast cipher (ChaCha20-Poly1305, incompatible with Python client)
+        #[arg(long)]
+        fast: bool,
     },
 
     /// Run as a relay server
@@ -144,6 +152,7 @@ async fn run_command(command: Commands) -> Result<()> {
             compress,
             connect_timeout,
             peer_timeout,
+            fast,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
@@ -162,6 +171,7 @@ async fn run_command(command: Commands) -> Result<()> {
                 } else {
                     Duration::from_secs(peer_timeout)
                 },
+                fast,
             };
 
             if let Some(text_msg) = text {
@@ -192,6 +202,7 @@ async fn run_command(command: Commands) -> Result<()> {
             accept,
             connect_timeout,
             peer_timeout,
+            fast,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
@@ -219,6 +230,7 @@ async fn run_command(command: Commands) -> Result<()> {
                 } else {
                     Duration::from_secs(peer_timeout)
                 },
+                fast,
             };
 
             client::receive(&code, &config).await?;
