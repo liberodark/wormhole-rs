@@ -26,6 +26,115 @@ fn nameplate_from_code(code: &str) -> Result<&str> {
     Ok(nameplate)
 }
 
+async fn build_transit_message() -> GenericMessage {
+    GenericMessage {
+        offer: None,
+        answer: None,
+        transit: Some(Transit {
+            abilities_v1: vec![
+                TransitAbility {
+                    ability_type: "direct-tcp-v1".to_string(),
+                },
+                TransitAbility {
+                    ability_type: "relay-v1".to_string(),
+                },
+            ],
+            hints_v1: transit::get_direct_hints().await,
+        }),
+        app_versions: None,
+        error: None,
+    }
+}
+
+fn build_file_ack() -> GenericMessage {
+    GenericMessage {
+        offer: None,
+        answer: Some(Answer {
+            message_ack: None,
+            file_ack: Some("ok".to_string()),
+        }),
+        transit: None,
+        app_versions: None,
+        error: None,
+    }
+}
+
+fn build_message_ack() -> GenericMessage {
+    GenericMessage {
+        offer: None,
+        answer: Some(Answer {
+            message_ack: Some("ok".to_string()),
+            file_ack: None,
+        }),
+        transit: None,
+        app_versions: None,
+        error: None,
+    }
+}
+
+fn build_reject() -> GenericMessage {
+    GenericMessage {
+        offer: None,
+        answer: None,
+        transit: None,
+        app_versions: None,
+        error: Some("transfer rejected".to_string()),
+    }
+}
+
+fn build_text_offer(text: &str) -> GenericMessage {
+    GenericMessage {
+        offer: Some(Offer {
+            message: Some(text.to_string()),
+            file: None,
+            directory: None,
+        }),
+        answer: None,
+        transit: None,
+        app_versions: None,
+        error: None,
+    }
+}
+
+fn build_file_offer(filename: String, filesize: u64) -> GenericMessage {
+    GenericMessage {
+        offer: Some(Offer {
+            message: None,
+            file: Some(OfferFile { filename, filesize }),
+            directory: None,
+        }),
+        answer: None,
+        transit: None,
+        app_versions: None,
+        error: None,
+    }
+}
+
+fn build_directory_offer(
+    dirname: String,
+    num_files: u64,
+    num_bytes: u64,
+    zipsize: u64,
+) -> GenericMessage {
+    GenericMessage {
+        offer: Some(Offer {
+            message: None,
+            file: None,
+            directory: Some(OfferDirectory {
+                dirname,
+                mode: "zipfile/deflated".to_string(),
+                numbytes: num_bytes,
+                numfiles: num_files,
+                zipsize,
+            }),
+        }),
+        answer: None,
+        transit: None,
+        app_versions: None,
+        error: None,
+    }
+}
+
 struct RendezvousClient {
     ws_sender: futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<
@@ -332,18 +441,12 @@ async fn recv_app_data(
     }
 }
 
-/// Send a text message through the wormhole
-pub async fn send_text(
-    relay_url: &str,
-    _transit_relay: &str,
-    text: &str,
+/// Allocate or use provided code, claim mailbox, print instructions
+async fn setup_sender(
+    client: &mut RendezvousClient,
     code: Option<&str>,
     code_length: usize,
-    verify: bool,
-) -> Result<()> {
-    let mut client = RendezvousClient::connect(relay_url).await?;
-    client.bind().await?;
-
+) -> Result<(String, String)> {
     let (code, nameplate) = if let Some(c) = code {
         let np = nameplate_from_code(c)?;
         (c.to_string(), np.to_string())
@@ -361,12 +464,21 @@ pub async fn send_text(
     println!("On the other computer, please run:");
     println!("  wormhole-rs recv {}", code);
 
-    let shared_key = do_pake(&mut client, &code).await?;
+    Ok((code, nameplate))
+}
 
+/// Verify shared key with user confirmation
+async fn verify_key(
+    client: &mut RendezvousClient,
+    shared_key: &[u8],
+    verify: bool,
+    is_sender: bool,
+) -> Result<()> {
     if verify {
-        let verifier = derive_verifier(&shared_key);
+        let verifier = derive_verifier(shared_key);
         println!("Verifier: {}", hex::encode(&verifier[..8]));
-        eprint!("Verify this matches the receiver? (yes/no): ");
+        let peer = if is_sender { "receiver" } else { "sender" };
+        eprint!("Verify this matches the {}? (yes/no): ", peer);
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.trim() != "yes" {
@@ -375,21 +487,71 @@ pub async fn send_text(
             anyhow::bail!("Verification rejected");
         }
     }
+    Ok(())
+}
 
+/// Wait for peer transit hints and file acknowledgment
+async fn wait_for_transit_ack(client: &mut RendezvousClient, shared_key: &[u8]) -> Result<Transit> {
+    let mut peer_transit = None;
+    let mut answer_received = false;
+
+    while !answer_received || peer_transit.is_none() {
+        let (_, msg) = recv_app_data(client, shared_key).await?;
+
+        if let Some(err) = msg.error {
+            anyhow::bail!("Transfer error: {}", err);
+        }
+
+        if let Some(t) = msg.transit {
+            peer_transit = Some(t);
+        }
+
+        if let Some(ans) = msg.answer
+            && ans.file_ack == Some("ok".to_string())
+        {
+            answer_received = true;
+        }
+    }
+
+    peer_transit.context("No transit hints from peer")
+}
+
+/// Prompt user to accept transfer, return false if rejected
+fn prompt_accept(prompt: &str) -> Result<bool> {
+    println!("{}", prompt);
+    eprint!("Accept? (y/n): ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_lowercase() == "y")
+}
+
+/// Handle transfer rejection
+async fn handle_rejection(client: &mut RendezvousClient, shared_key: &[u8]) -> Result<()> {
+    send_app_data(client, shared_key, 0, &build_reject()).await?;
+    client.close(Mood::Happy).await?;
+    client.shutdown().await?;
+    anyhow::bail!("Transfer rejected");
+}
+
+/// Send a text message through the wormhole
+pub async fn send_text(
+    relay_url: &str,
+    _transit_relay: &str,
+    text: &str,
+    code: Option<&str>,
+    code_length: usize,
+    verify: bool,
+) -> Result<()> {
+    let mut client = RendezvousClient::connect(relay_url).await?;
+    client.bind().await?;
+
+    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
+    let shared_key = do_pake(&mut client, &code).await?;
+
+    verify_key(&mut client, &shared_key, verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
-    let offer = GenericMessage {
-        offer: Some(Offer {
-            message: Some(text.to_string()),
-            file: None,
-            directory: None,
-        }),
-        answer: None,
-        transit: None,
-        app_versions: None,
-        error: None,
-    };
-    send_app_data(&mut client, &shared_key, 0, &offer).await?;
+    send_app_data(&mut client, &shared_key, 0, &build_text_offer(text)).await?;
 
     let (_, answer) = recv_app_data(&mut client, &shared_key).await?;
 
@@ -429,95 +591,24 @@ pub async fn send_file(
     let mut client = RendezvousClient::connect(relay_url).await?;
     client.bind().await?;
 
-    let (code, nameplate) = if let Some(c) = code {
-        let np = nameplate_from_code(c)?;
-        (c.to_string(), np.to_string())
-    } else {
-        let nameplate = client.allocate().await?;
-        let passphrase = wordlist::generate_passphrase(code_length);
-        let code = format!("{}-{}", nameplate, passphrase);
-        (code, nameplate)
-    };
-
-    let mailbox = client.claim(&nameplate).await?;
-    client.open(&mailbox).await?;
-
-    println!("Wormhole code is: {}", code);
-    println!("On the other computer, please run:");
-    println!("  wormhole-rs recv {}", code);
-
+    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
     let shared_key = do_pake(&mut client, &code).await?;
 
-    if verify {
-        let verifier = derive_verifier(&shared_key);
-        println!("Verifier: {}", hex::encode(&verifier[..8]));
-        eprint!("Verify this matches the receiver? (yes/no): ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != "yes" {
-            client.close(Mood::Errory).await?;
-            client.shutdown().await?;
-            anyhow::bail!("Verification rejected");
-        }
-    }
-
+    verify_key(&mut client, &shared_key, verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
-    let transit_msg = GenericMessage {
-        offer: None,
-        answer: None,
-        transit: Some(Transit {
-            abilities_v1: vec![
-                TransitAbility {
-                    ability_type: "direct-tcp-v1".to_string(),
-                },
-                TransitAbility {
-                    ability_type: "relay-v1".to_string(),
-                },
-            ],
-            hints_v1: transit::get_direct_hints().await,
-        }),
-        app_versions: None,
-        error: None,
-    };
-    send_app_data(&mut client, &shared_key, 0, &transit_msg).await?;
 
-    let offer = GenericMessage {
-        offer: Some(Offer {
-            message: None,
-            file: Some(OfferFile { filename, filesize }),
-            directory: None,
-        }),
-        answer: None,
-        transit: None,
-        app_versions: None,
-        error: None,
-    };
-    send_app_data(&mut client, &shared_key, 1, &offer).await?;
+    send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+    send_app_data(
+        &mut client,
+        &shared_key,
+        1,
+        &build_file_offer(filename, filesize),
+    )
+    .await?;
 
-    let mut peer_transit = None;
-    let mut answer_received = false;
-
-    while !answer_received || peer_transit.is_none() {
-        let (_, msg) = recv_app_data(&mut client, &shared_key).await?;
-
-        if let Some(err) = msg.error {
-            anyhow::bail!("Transfer error: {}", err);
-        }
-
-        if let Some(t) = msg.transit {
-            peer_transit = Some(t);
-        }
-
-        if let Some(ans) = msg.answer
-            && ans.file_ack == Some("ok".to_string())
-        {
-            answer_received = true;
-        }
-    }
-
-    let peer_transit = peer_transit.context("No transit hints from peer")?;
+    let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
     let conn = transit::connect_as_sender(&transit_key, &peer_transit, transit_relay).await?;
 
     let mut file = File::open(path).await?;
@@ -551,101 +642,24 @@ pub async fn send_directory(
     let mut client = RendezvousClient::connect(relay_url).await?;
     client.bind().await?;
 
-    let (code, nameplate) = if let Some(c) = code {
-        let np = nameplate_from_code(c)?;
-        (c.to_string(), np.to_string())
-    } else {
-        let nameplate = client.allocate().await?;
-        let passphrase = wordlist::generate_passphrase(code_length);
-        let code = format!("{}-{}", nameplate, passphrase);
-        (code, nameplate)
-    };
-
-    let mailbox = client.claim(&nameplate).await?;
-    client.open(&mailbox).await?;
-
-    println!("Wormhole code is: {}", code);
-    println!("On the other computer, please run:");
-    println!("  wormhole-rs recv {}", code);
-
+    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
     let shared_key = do_pake(&mut client, &code).await?;
 
-    if verify {
-        let verifier = derive_verifier(&shared_key);
-        println!("Verifier: {}", hex::encode(&verifier[..8]));
-        eprint!("Verify this matches the receiver? (yes/no): ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != "yes" {
-            client.close(Mood::Errory).await?;
-            client.shutdown().await?;
-            anyhow::bail!("Verification rejected");
-        }
-    }
-
+    verify_key(&mut client, &shared_key, verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
-    let transit_msg = GenericMessage {
-        offer: None,
-        answer: None,
-        transit: Some(Transit {
-            abilities_v1: vec![
-                TransitAbility {
-                    ability_type: "direct-tcp-v1".to_string(),
-                },
-                TransitAbility {
-                    ability_type: "relay-v1".to_string(),
-                },
-            ],
-            hints_v1: transit::get_direct_hints().await,
-        }),
-        app_versions: None,
-        error: None,
-    };
-    send_app_data(&mut client, &shared_key, 0, &transit_msg).await?;
 
-    let offer = GenericMessage {
-        offer: Some(Offer {
-            message: None,
-            file: None,
-            directory: Some(OfferDirectory {
-                dirname,
-                mode: "zipfile/deflated".to_string(),
-                numbytes: num_bytes,
-                numfiles: num_files,
-                zipsize,
-            }),
-        }),
-        answer: None,
-        transit: None,
-        app_versions: None,
-        error: None,
-    };
-    send_app_data(&mut client, &shared_key, 1, &offer).await?;
+    send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+    send_app_data(
+        &mut client,
+        &shared_key,
+        1,
+        &build_directory_offer(dirname, num_files, num_bytes, zipsize),
+    )
+    .await?;
 
-    let mut peer_transit = None;
-    let mut answer_received = false;
-
-    while !answer_received || peer_transit.is_none() {
-        let (_, msg) = recv_app_data(&mut client, &shared_key).await?;
-
-        if let Some(err) = msg.error {
-            anyhow::bail!("Transfer error: {}", err);
-        }
-
-        if let Some(t) = msg.transit {
-            peer_transit = Some(t);
-        }
-
-        if let Some(ans) = msg.answer
-            && ans.file_ack == Some("ok".to_string())
-        {
-            answer_received = true;
-        }
-    }
-
-    let peer_transit = peer_transit.context("No transit hints from peer")?;
+    let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
     let conn = transit::connect_as_sender(&transit_key, &peer_transit, transit_relay).await?;
 
     let mut cursor = std::io::Cursor::new(zip_data);
@@ -678,19 +692,7 @@ pub async fn receive(
 
     let shared_key = do_pake(&mut client, code).await?;
 
-    if verify {
-        let verifier = derive_verifier(&shared_key);
-        println!("Verifier: {}", hex::encode(&verifier[..8]));
-        eprint!("Verify this matches the sender? (yes/no): ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != "yes" {
-            client.close(Mood::Errory).await?;
-            client.shutdown().await?;
-            anyhow::bail!("Verification rejected");
-        }
-    }
-
+    verify_key(&mut client, &shared_key, verify, false).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let mut offer = None;
@@ -715,20 +717,8 @@ pub async fn receive(
     let offer = offer.unwrap();
 
     if let Some(text) = offer.message {
-        let answer = GenericMessage {
-            offer: None,
-            answer: Some(Answer {
-                message_ack: Some("ok".to_string()),
-                file_ack: None,
-            }),
-            transit: None,
-            app_versions: None,
-            error: None,
-        };
-        send_app_data(&mut client, &shared_key, 0, &answer).await?;
-
+        send_app_data(&mut client, &shared_key, 0, &build_message_ack()).await?;
         println!("{}", text);
-
         client.graceful_close(nameplate, Mood::Happy).await;
     } else if let Some(file_offer) = offer.file {
         let output_path = output_dir
@@ -736,59 +726,19 @@ pub async fn receive(
             .unwrap_or_else(|| std::path::PathBuf::from(&file_offer.filename));
 
         if !auto_accept {
-            println!(
+            let prompt = format!(
                 "Receiving file ({} bytes): {}",
                 file_offer.filesize, file_offer.filename
             );
-            eprint!("Accept? (y/n): ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if input.trim().to_lowercase() != "y" {
-                let reject = GenericMessage {
-                    offer: None,
-                    answer: None,
-                    transit: None,
-                    app_versions: None,
-                    error: Some("transfer rejected".to_string()),
-                };
-                send_app_data(&mut client, &shared_key, 0, &reject).await?;
-                client.close(Mood::Happy).await?;
-                client.shutdown().await?;
-                anyhow::bail!("Transfer rejected");
+            if !prompt_accept(&prompt)? {
+                handle_rejection(&mut client, &shared_key).await?;
             }
         }
 
         let transit_key = derive_transit_key(&shared_key, APP_ID);
-        let transit_msg = GenericMessage {
-            offer: None,
-            answer: None,
-            transit: Some(Transit {
-                abilities_v1: vec![
-                    TransitAbility {
-                        ability_type: "direct-tcp-v1".to_string(),
-                    },
-                    TransitAbility {
-                        ability_type: "relay-v1".to_string(),
-                    },
-                ],
-                hints_v1: transit::get_direct_hints().await,
-            }),
-            app_versions: None,
-            error: None,
-        };
-        send_app_data(&mut client, &shared_key, 0, &transit_msg).await?;
 
-        let answer = GenericMessage {
-            offer: None,
-            answer: Some(Answer {
-                message_ack: None,
-                file_ack: Some("ok".to_string()),
-            }),
-            transit: None,
-            app_versions: None,
-            error: None,
-        };
-        send_app_data(&mut client, &shared_key, 1, &answer).await?;
+        send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+        send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
         let conn = transit::connect_as_receiver(&transit_key, &peer_transit, transit_relay).await?;
@@ -805,59 +755,19 @@ pub async fn receive(
             .unwrap_or_else(|| std::path::PathBuf::from(&dir_offer.dirname));
 
         if !auto_accept {
-            println!(
+            let prompt = format!(
                 "Receiving directory ({} files, {} bytes): {}",
                 dir_offer.numfiles, dir_offer.numbytes, dir_offer.dirname
             );
-            eprint!("Accept? (y/n): ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if input.trim().to_lowercase() != "y" {
-                let reject = GenericMessage {
-                    offer: None,
-                    answer: None,
-                    transit: None,
-                    app_versions: None,
-                    error: Some("transfer rejected".to_string()),
-                };
-                send_app_data(&mut client, &shared_key, 0, &reject).await?;
-                client.close(Mood::Happy).await?;
-                client.shutdown().await?;
-                anyhow::bail!("Transfer rejected");
+            if !prompt_accept(&prompt)? {
+                handle_rejection(&mut client, &shared_key).await?;
             }
         }
 
         let transit_key = derive_transit_key(&shared_key, APP_ID);
-        let transit_msg = GenericMessage {
-            offer: None,
-            answer: None,
-            transit: Some(Transit {
-                abilities_v1: vec![
-                    TransitAbility {
-                        ability_type: "direct-tcp-v1".to_string(),
-                    },
-                    TransitAbility {
-                        ability_type: "relay-v1".to_string(),
-                    },
-                ],
-                hints_v1: transit::get_direct_hints().await,
-            }),
-            app_versions: None,
-            error: None,
-        };
-        send_app_data(&mut client, &shared_key, 0, &transit_msg).await?;
 
-        let answer = GenericMessage {
-            offer: None,
-            answer: Some(Answer {
-                message_ack: None,
-                file_ack: Some("ok".to_string()),
-            }),
-            transit: None,
-            app_versions: None,
-            error: None,
-        };
-        send_app_data(&mut client, &shared_key, 1, &answer).await?;
+        send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+        send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
         let conn = transit::connect_as_receiver(&transit_key, &peer_transit, transit_relay).await?;
