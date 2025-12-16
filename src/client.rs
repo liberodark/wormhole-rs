@@ -84,7 +84,7 @@ fn nameplate_from_code(code: &str) -> Result<&str> {
     Ok(nameplate)
 }
 
-async fn build_transit_message() -> GenericMessage {
+fn build_transit_message(hints: Vec<crate::messages::TransitHint>) -> GenericMessage {
     GenericMessage {
         offer: None,
         answer: None,
@@ -97,7 +97,7 @@ async fn build_transit_message() -> GenericMessage {
                     ability_type: "relay-v1".to_string(),
                 },
             ],
-            hints_v1: transit::get_direct_hints().await,
+            hints_v1: hints,
         }),
         app_versions: None,
         error: None,
@@ -711,7 +711,14 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
 
-    send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+    // Create direct listener for peer to connect to us
+    let listener = transit::create_direct_listener().await.ok();
+    let hints = listener
+        .as_ref()
+        .map(|l| l.hints.clone())
+        .unwrap_or_default();
+
+    send_app_data(&mut client, &shared_key, 0, &build_transit_message(hints)).await?;
     send_app_data(
         &mut client,
         &shared_key,
@@ -726,6 +733,7 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
         &peer_transit,
         config.transit_relay,
         config.connect_timeout,
+        listener,
     )
     .await?;
 
@@ -768,7 +776,14 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
 
-    send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+    // Create direct listener for peer to connect to us
+    let listener = transit::create_direct_listener().await.ok();
+    let hints = listener
+        .as_ref()
+        .map(|l| l.hints.clone())
+        .unwrap_or_default();
+
+    send_app_data(&mut client, &shared_key, 0, &build_transit_message(hints)).await?;
     send_app_data(
         &mut client,
         &shared_key,
@@ -783,6 +798,7 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
         &peer_transit,
         config.transit_relay,
         config.connect_timeout,
+        listener,
     )
     .await?;
 
@@ -885,7 +901,14 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
 
         let transit_key = derive_transit_key(&shared_key, APP_ID);
 
-        send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+        // Create direct listener for peer to connect to us
+        let listener = transit::create_direct_listener().await.ok();
+        let hints = listener
+            .as_ref()
+            .map(|l| l.hints.clone())
+            .unwrap_or_default();
+
+        send_app_data(&mut client, &shared_key, 0, &build_transit_message(hints)).await?;
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
@@ -894,6 +917,7 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
             &peer_transit,
             config.transit_relay,
             config.connect_timeout,
+            listener,
         )
         .await?;
 
@@ -931,7 +955,14 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
 
         let transit_key = derive_transit_key(&shared_key, APP_ID);
 
-        send_app_data(&mut client, &shared_key, 0, &build_transit_message().await).await?;
+        // Create direct listener for peer to connect to us
+        let listener = transit::create_direct_listener().await.ok();
+        let hints = listener
+            .as_ref()
+            .map(|l| l.hints.clone())
+            .unwrap_or_default();
+
+        send_app_data(&mut client, &shared_key, 0, &build_transit_message(hints)).await?;
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
@@ -940,6 +971,7 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
             &peer_transit,
             config.transit_relay,
             config.connect_timeout,
+            listener,
         )
         .await?;
 

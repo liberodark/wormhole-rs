@@ -158,8 +158,126 @@ impl TransitConnection {
     }
 }
 
-pub async fn get_direct_hints() -> Vec<TransitHint> {
-    Vec::new()
+/// Get local IP addresses (non-loopback)
+fn get_local_ips() -> Vec<std::net::IpAddr> {
+    let mut ips = Vec::new();
+
+    // Try to get IPs by connecting to a public address (doesn't actually connect)
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        // Connect to Google DNS to determine local IP (no actual traffic sent)
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                ips.push(addr.ip());
+            }
+        }
+    }
+
+    // Also try IPv6
+    if let Ok(socket) = std::net::UdpSocket::bind("[::]:0") {
+        if socket.connect("[2001:4860:4860::8888]:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip();
+                // Skip link-local IPv6
+                if let std::net::IpAddr::V6(v6) = ip {
+                    if !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    ips
+}
+
+/// Listener for direct connections
+pub struct DirectListener {
+    listener: tokio::net::TcpListener,
+    pub hints: Vec<TransitHint>,
+}
+
+impl DirectListener {
+    /// Create a new listener on a random port and generate hints
+    pub async fn new() -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let ips = get_local_ips();
+        let hints: Vec<TransitHint> = ips
+            .into_iter()
+            .map(|ip| TransitHint {
+                hint_type: "direct-tcp-v1".to_string(),
+                priority: Some(0.0),
+                hostname: Some(ip.to_string()),
+                port: Some(port),
+                hints: None,
+            })
+            .collect();
+
+        Ok(Self { listener, hints })
+    }
+
+    /// Accept a connection and perform sender handshake
+    /// Called when we are the SENDER and RECEIVER connects to us
+    pub async fn accept_as_sender(self, transit_key: &[u8; KEY_SIZE]) -> Result<TransitConnection> {
+        let (mut stream, _addr) = self.listener.accept().await?;
+        configure_stream(&stream)?;
+
+        // We are the SENDER, so send sender handshake first
+        let handshake = derive_transit_sender_handshake(transit_key);
+        stream.write_all(&handshake).await?;
+
+        // Wait for receiver handshake
+        let expected = derive_transit_receiver_handshake(transit_key);
+        let mut response = vec![0u8; expected.len()];
+        stream.read_exact(&mut response).await?;
+
+        if response != expected {
+            anyhow::bail!("Invalid receiver handshake on direct connection");
+        }
+
+        // Send "go"
+        stream.write_all(b"go\n").await?;
+
+        Ok(TransitConnection::new(stream, transit_key, true))
+    }
+
+    /// Accept a connection and perform receiver handshake
+    /// Called when we are the RECEIVER and SENDER connects to us
+    pub async fn accept_as_receiver(
+        self,
+        transit_key: &[u8; KEY_SIZE],
+    ) -> Result<TransitConnection> {
+        let (mut stream, _addr) = self.listener.accept().await?;
+        configure_stream(&stream)?;
+
+        // Wait for sender handshake from connecting SENDER
+        let expected = derive_transit_sender_handshake(transit_key);
+        let mut response = vec![0u8; expected.len()];
+        stream.read_exact(&mut response).await?;
+
+        if response != expected {
+            anyhow::bail!("Invalid sender handshake on direct connection");
+        }
+
+        // We are the RECEIVER, send receiver handshake
+        let handshake = derive_transit_receiver_handshake(transit_key);
+        stream.write_all(&handshake).await?;
+
+        // Wait for "go"
+        let mut go_buf = [0u8; 3];
+        stream.read_exact(&mut go_buf).await?;
+        if &go_buf != b"go\n" {
+            anyhow::bail!("Did not receive 'go' on direct connection");
+        }
+
+        Ok(TransitConnection::new(stream, transit_key, false))
+    }
+}
+
+/// Create a direct listener and return hints with actual port
+pub async fn create_direct_listener() -> Result<DirectListener> {
+    DirectListener::new().await
 }
 
 fn configure_stream(stream: &TcpStream) -> Result<()> {
@@ -172,20 +290,97 @@ pub async fn connect_as_sender(
     peer_hints: &Transit,
     relay_addr: &str,
     timeout: Duration,
+    listener: Option<DirectListener>,
 ) -> Result<Arc<TransitConnection>> {
-    for hint in &peer_hints.hints_v1 {
-        if hint.hint_type == "direct-tcp-v1"
-            && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
-        {
-            let addr = format!("{}:{}", host, port);
-            if let Ok(conn) = try_connect_direct_sender(transit_key, &addr, timeout).await {
-                return Ok(Arc::new(conn));
+    use tokio::sync::oneshot;
+
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+
+    // Collect direct addresses from peer hints
+    let direct_addrs: Vec<String> = peer_hints
+        .hints_v1
+        .iter()
+        .filter(|h| h.hint_type == "direct-tcp-v1")
+        .filter_map(|h| {
+            if let (Some(host), Some(port)) = (&h.hostname, h.port) {
+                Some(format!("{}:{}", host, port))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Task 1: Accept on our listener (peer connects to us)
+    let listener_task = {
+        let transit_key = *transit_key;
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            if let Some(listener) = listener {
+                let result = listener.accept_as_sender(&transit_key).await;
+                if result.is_ok() {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+                result
+            } else {
+                // No listener, this task never completes
+                std::future::pending().await
             }
         }
-    }
+    };
 
-    let conn = connect_via_relay_sender(transit_key, relay_addr, timeout).await?;
-    Ok(Arc::new(conn))
+    // Task 2: Connect to peer's direct hints
+    let direct_task = {
+        let transit_key = *transit_key;
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            for addr in direct_addrs {
+                if let Ok(conn) = try_connect_direct_sender(&transit_key, &addr, timeout).await {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    return Ok(conn);
+                }
+            }
+            Err(anyhow::anyhow!("All direct connections failed"))
+        }
+    };
+
+    // Task 3: Connect via relay (fallback)
+    let relay_task = {
+        let transit_key = *transit_key;
+        let relay_addr = relay_addr.to_string();
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            // Small delay to prefer direct connections
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let result = connect_via_relay_sender(&transit_key, &relay_addr, timeout).await;
+            if result.is_ok() {
+                if let Some(tx) = done_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            result
+        }
+    };
+
+    // Race all tasks with overall timeout
+    let result = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            biased;
+
+            result = listener_task => result,
+            result = direct_task => result,
+            result = relay_task => result,
+            _ = done_rx => Err(anyhow::anyhow!("Connection established elsewhere")),
+        }
+    })
+    .await
+    .context("Transit connection timed out")?;
+
+    result.map(|conn| Arc::new(conn))
 }
 
 pub async fn connect_as_receiver(
@@ -193,20 +388,90 @@ pub async fn connect_as_receiver(
     peer_hints: &Transit,
     relay_addr: &str,
     timeout: Duration,
+    listener: Option<DirectListener>,
 ) -> Result<Arc<TransitConnection>> {
-    for hint in &peer_hints.hints_v1 {
-        if hint.hint_type == "direct-tcp-v1"
-            && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
-        {
-            let addr = format!("{}:{}", host, port);
-            if let Ok(conn) = try_connect_direct_receiver(transit_key, &addr, timeout).await {
-                return Ok(Arc::new(conn));
+    use tokio::sync::oneshot;
+
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+
+    let direct_addrs: Vec<String> = peer_hints
+        .hints_v1
+        .iter()
+        .filter(|h| h.hint_type == "direct-tcp-v1")
+        .filter_map(|h| {
+            if let (Some(host), Some(port)) = (&h.hostname, h.port) {
+                Some(format!("{}:{}", host, port))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let listener_task = {
+        let transit_key = *transit_key;
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            if let Some(listener) = listener {
+                let result = listener.accept_as_receiver(&transit_key).await;
+                if result.is_ok() {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+                result
+            } else {
+                std::future::pending().await
             }
         }
-    }
+    };
 
-    let conn = connect_via_relay_receiver(transit_key, relay_addr, timeout).await?;
-    Ok(Arc::new(conn))
+    let direct_task = {
+        let transit_key = *transit_key;
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            for addr in direct_addrs {
+                if let Ok(conn) = try_connect_direct_receiver(&transit_key, &addr, timeout).await {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    return Ok(conn);
+                }
+            }
+            Err(anyhow::anyhow!("All direct connections failed"))
+        }
+    };
+
+    let relay_task = {
+        let transit_key = *transit_key;
+        let relay_addr = relay_addr.to_string();
+        let done_tx = Arc::clone(&done_tx);
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let result = connect_via_relay_receiver(&transit_key, &relay_addr, timeout).await;
+            if result.is_ok() {
+                if let Some(tx) = done_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            result
+        }
+    };
+
+    let result = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            biased;
+
+            result = listener_task => result,
+            result = direct_task => result,
+            result = relay_task => result,
+            _ = done_rx => Err(anyhow::anyhow!("Connection established elsewhere")),
+        }
+    })
+    .await
+    .context("Transit connection timed out")?;
+
+    result.map(|conn| Arc::new(conn))
 }
 
 async fn try_connect_direct_sender(
@@ -726,5 +991,29 @@ mod tests {
         assert_eq!(Compression::from_mode("zipfile/deflated"), Compression::Zip);
         assert_eq!(Compression::from_mode("tarball/zstd"), Compression::Zstd);
         assert_eq!(Compression::from_mode("unknown"), Compression::Zip);
+    }
+
+    #[test]
+    fn test_get_local_ips() {
+        let ips = get_local_ips();
+        // Should get at least one IP on most systems
+        // (might be empty in some CI environments)
+        for ip in &ips {
+            assert!(!ip.is_loopback());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_direct_listener_creation() {
+        let listener = DirectListener::new().await;
+        assert!(listener.is_ok());
+
+        let listener = listener.unwrap();
+        // Should have hints if we have local IPs
+        // Each hint should have a valid port
+        for hint in &listener.hints {
+            assert_eq!(hint.hint_type, "direct-tcp-v1");
+            assert!(hint.port.unwrap() > 0);
+        }
     }
 }
