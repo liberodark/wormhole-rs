@@ -146,6 +146,7 @@ pub struct Pong {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tx: Option<f64>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMessage {
@@ -214,6 +215,12 @@ pub struct Offer {
 pub struct OfferFile {
     pub filename: String,
     pub filesize: u64,
+    /// Compression mode (e.g., "zstd"). None means uncompressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Original uncompressed size (only present when compressed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +367,8 @@ mod tests {
             file: Some(OfferFile {
                 filename: "test.txt".to_string(),
                 filesize: 1024,
+                mode: None,
+                original_size: None,
             }),
             directory: None,
         };
@@ -368,6 +377,26 @@ mod tests {
         assert!(json.contains("test.txt"));
         assert!(json.contains("1024"));
         assert!(!json.contains("message"));
+        assert!(!json.contains("mode"));
+    }
+
+    #[test]
+    fn test_offer_file_compressed_serialization() {
+        let offer = Offer {
+            message: None,
+            file: Some(OfferFile {
+                filename: "test.txt.zst".to_string(),
+                filesize: 512,
+                mode: Some("zstd".to_string()),
+                original_size: Some(1024),
+            }),
+            directory: None,
+        };
+
+        let json = serde_json::to_string(&offer).unwrap();
+        assert!(json.contains("test.txt.zst"));
+        assert!(json.contains("\"mode\":\"zstd\""));
+        assert!(json.contains("\"original_size\":1024"));
     }
 
     #[test]

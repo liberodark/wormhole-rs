@@ -16,7 +16,53 @@ use crate::messages::{
 };
 use crate::transit;
 use crate::wordlist;
-use crate::{AGENT_STRING, AGENT_VERSION, APP_ID};
+use crate::{AGENT_STRING, AGENT_VERSION, APP_ID, DEFAULT_RELAY_URL, DEFAULT_TRANSIT_RELAY};
+
+pub struct SendConfig<'a> {
+    pub relay_url: &'a str,
+    pub transit_relay: &'a str,
+    pub code: Option<&'a str>,
+    pub code_length: usize,
+    pub verify: bool,
+    pub hide_progress: bool,
+    pub compression: transit::Compression,
+}
+
+impl Default for SendConfig<'_> {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_RELAY_URL,
+            transit_relay: DEFAULT_TRANSIT_RELAY,
+            code: None,
+            code_length: 2,
+            verify: false,
+            hide_progress: false,
+            compression: transit::Compression::Zip,
+        }
+    }
+}
+
+pub struct ReceiveConfig<'a> {
+    pub relay_url: &'a str,
+    pub transit_relay: &'a str,
+    pub output_dir: Option<&'a Path>,
+    pub verify: bool,
+    pub hide_progress: bool,
+    pub auto_accept: bool,
+}
+
+impl Default for ReceiveConfig<'_> {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_RELAY_URL,
+            transit_relay: DEFAULT_TRANSIT_RELAY,
+            output_dir: None,
+            verify: false,
+            hide_progress: false,
+            auto_accept: false,
+        }
+    }
+}
 
 fn nameplate_from_code(code: &str) -> Result<&str> {
     let nameplate = code.split('-').next().context("Invalid code format")?;
@@ -96,11 +142,21 @@ fn build_text_offer(text: &str) -> GenericMessage {
     }
 }
 
-fn build_file_offer(filename: String, filesize: u64) -> GenericMessage {
+fn build_file_offer(
+    filename: String,
+    filesize: u64,
+    mode: Option<String>,
+    original_size: Option<u64>,
+) -> GenericMessage {
     GenericMessage {
         offer: Some(Offer {
             message: None,
-            file: Some(OfferFile { filename, filesize }),
+            file: Some(OfferFile {
+                filename,
+                filesize,
+                mode,
+                original_size,
+            }),
             directory: None,
         }),
         answer: None,
@@ -115,6 +171,7 @@ fn build_directory_offer(
     num_files: u64,
     num_bytes: u64,
     zipsize: u64,
+    compression: transit::Compression,
 ) -> GenericMessage {
     GenericMessage {
         offer: Some(Offer {
@@ -122,7 +179,7 @@ fn build_directory_offer(
             file: None,
             directory: Some(OfferDirectory {
                 dirname,
-                mode: "zipfile/deflated".to_string(),
+                mode: compression.mode_string().to_string(),
                 numbytes: num_bytes,
                 numfiles: num_files,
                 zipsize,
@@ -333,6 +390,7 @@ impl RendezvousClient {
         Ok(())
     }
 
+    /// Graceful shutdown - errors are ignored since transfer is already complete
     async fn graceful_close(&mut self, nameplate: &str, mood: Mood) {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let _ = self.release(nameplate).await;
@@ -534,21 +592,14 @@ async fn handle_rejection(client: &mut RendezvousClient, shared_key: &[u8]) -> R
 }
 
 /// Send a text message through the wormhole
-pub async fn send_text(
-    relay_url: &str,
-    _transit_relay: &str,
-    text: &str,
-    code: Option<&str>,
-    code_length: usize,
-    verify: bool,
-) -> Result<()> {
-    let mut client = RendezvousClient::connect(relay_url).await?;
+pub async fn send_text(text: &str, config: &SendConfig<'_>) -> Result<()> {
+    let mut client = RendezvousClient::connect(config.relay_url).await?;
     client.bind().await?;
 
-    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
+    let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
     let shared_key = do_pake(&mut client, &code).await?;
 
-    verify_key(&mut client, &shared_key, verify, true).await?;
+    verify_key(&mut client, &shared_key, config.verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     send_app_data(&mut client, &shared_key, 0, &build_text_offer(text)).await?;
@@ -571,30 +622,41 @@ pub async fn send_text(
 }
 
 /// Send a file through the wormhole
-pub async fn send_file(
-    relay_url: &str,
-    transit_relay: &str,
-    path: &Path,
-    code: Option<&str>,
-    code_length: usize,
-    verify: bool,
-    hide_progress: bool,
-) -> Result<()> {
+pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     let metadata = tokio::fs::metadata(path).await?;
-    let filename = path
+    let original_filename = path
         .file_name()
         .context("Invalid filename")?
         .to_string_lossy()
         .to_string();
-    let filesize = metadata.len();
+    let original_size = metadata.len();
 
-    let mut client = RendezvousClient::connect(relay_url).await?;
+    // Prepare file data based on compression
+    let (data, filename, filesize, mode, orig_size) = match config.compression {
+        transit::Compression::Zstd => {
+            let compressed = transit::compress_file(path).await?;
+            let compressed_size = compressed.len() as u64;
+            (
+                Some(compressed),
+                format!("{}.zst", original_filename),
+                compressed_size,
+                Some("zstd".to_string()),
+                Some(original_size),
+            )
+        }
+        transit::Compression::Zip => {
+            // No compression for single files in zip mode
+            (None, original_filename, original_size, None, None)
+        }
+    };
+
+    let mut client = RendezvousClient::connect(config.relay_url).await?;
     client.bind().await?;
 
-    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
+    let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
     let shared_key = do_pake(&mut client, &code).await?;
 
-    verify_key(&mut client, &shared_key, verify, true).await?;
+    verify_key(&mut client, &shared_key, config.verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
@@ -604,15 +666,23 @@ pub async fn send_file(
         &mut client,
         &shared_key,
         1,
-        &build_file_offer(filename, filesize),
+        &build_file_offer(filename, filesize, mode, orig_size),
     )
     .await?;
 
     let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
-    let conn = transit::connect_as_sender(&transit_key, &peer_transit, transit_relay).await?;
+    let conn =
+        transit::connect_as_sender(&transit_key, &peer_transit, config.transit_relay).await?;
 
-    let mut file = File::open(path).await?;
-    transit::send_file(&conn, &mut file, filesize, hide_progress).await?;
+    if let Some(compressed_data) = data {
+        // Send compressed data from memory
+        let mut cursor = std::io::Cursor::new(compressed_data);
+        transit::send_file(&conn, &mut cursor, filesize, config.hide_progress).await?;
+    } else {
+        // Send file directly
+        let mut file = File::open(path).await?;
+        transit::send_file(&conn, &mut file, filesize, config.hide_progress).await?;
+    }
 
     println!("file sent");
 
@@ -622,16 +692,9 @@ pub async fn send_file(
 }
 
 /// Send a directory through the wormhole
-pub async fn send_directory(
-    relay_url: &str,
-    transit_relay: &str,
-    path: &Path,
-    code: Option<&str>,
-    code_length: usize,
-    verify: bool,
-    hide_progress: bool,
-) -> Result<()> {
-    let (zip_data, num_files, num_bytes) = transit::create_zip(path).await?;
+pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> {
+    let (zip_data, num_files, num_bytes) =
+        transit::create_archive(path, config.compression).await?;
     let dirname = path
         .file_name()
         .context("Invalid directory name")?
@@ -639,13 +702,13 @@ pub async fn send_directory(
         .to_string();
     let zipsize = zip_data.len() as u64;
 
-    let mut client = RendezvousClient::connect(relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url).await?;
     client.bind().await?;
 
-    let (code, nameplate) = setup_sender(&mut client, code, code_length).await?;
+    let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
     let shared_key = do_pake(&mut client, &code).await?;
 
-    verify_key(&mut client, &shared_key, verify, true).await?;
+    verify_key(&mut client, &shared_key, config.verify, true).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
@@ -655,15 +718,16 @@ pub async fn send_directory(
         &mut client,
         &shared_key,
         1,
-        &build_directory_offer(dirname, num_files, num_bytes, zipsize),
+        &build_directory_offer(dirname, num_files, num_bytes, zipsize, config.compression),
     )
     .await?;
 
     let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
-    let conn = transit::connect_as_sender(&transit_key, &peer_transit, transit_relay).await?;
+    let conn =
+        transit::connect_as_sender(&transit_key, &peer_transit, config.transit_relay).await?;
 
     let mut cursor = std::io::Cursor::new(zip_data);
-    transit::send_file(&conn, &mut cursor, zipsize, hide_progress).await?;
+    transit::send_file(&conn, &mut cursor, zipsize, config.hide_progress).await?;
 
     println!("directory sent");
 
@@ -673,18 +737,10 @@ pub async fn send_directory(
 }
 
 /// Receive a file, directory, or text message through the wormhole
-pub async fn receive(
-    relay_url: &str,
-    transit_relay: &str,
-    code: &str,
-    output_dir: Option<&Path>,
-    verify: bool,
-    hide_progress: bool,
-    auto_accept: bool,
-) -> Result<()> {
+pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
     let nameplate = nameplate_from_code(code)?;
 
-    let mut client = RendezvousClient::connect(relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url).await?;
     client.bind().await?;
 
     let mailbox = client.claim(nameplate).await?;
@@ -692,7 +748,7 @@ pub async fn receive(
 
     let shared_key = do_pake(&mut client, code).await?;
 
-    verify_key(&mut client, &shared_key, verify, false).await?;
+    verify_key(&mut client, &shared_key, config.verify, false).await?;
     exchange_versions(&mut client, &shared_key).await?;
 
     let mut offer = None;
@@ -721,15 +777,38 @@ pub async fn receive(
         println!("{}", text);
         client.graceful_close(nameplate, Mood::Happy).await;
     } else if let Some(file_offer) = offer.file {
-        let output_path = output_dir
-            .map(|d| d.join(&file_offer.filename))
-            .unwrap_or_else(|| std::path::PathBuf::from(&file_offer.filename));
+        // Determine if file is compressed
+        let is_compressed = file_offer.mode.as_deref() == Some("zstd");
 
-        if !auto_accept {
-            let prompt = format!(
-                "Receiving file ({} bytes): {}",
-                file_offer.filesize, file_offer.filename
-            );
+        // Use original filename (strip .zst if compressed)
+        let final_filename = if is_compressed {
+            file_offer
+                .filename
+                .strip_suffix(".zst")
+                .unwrap_or(&file_offer.filename)
+                .to_string()
+        } else {
+            file_offer.filename.clone()
+        };
+
+        let output_path = config
+            .output_dir
+            .map(|d| d.join(&final_filename))
+            .unwrap_or_else(|| std::path::PathBuf::from(&final_filename));
+
+        if !config.auto_accept {
+            let prompt = if is_compressed {
+                let orig_size = file_offer.original_size.unwrap_or(file_offer.filesize);
+                format!(
+                    "Receiving file ({} bytes, compressed): {}",
+                    orig_size, final_filename
+                )
+            } else {
+                format!(
+                    "Receiving file ({} bytes): {}",
+                    file_offer.filesize, file_offer.filename
+                )
+            };
             if !prompt_accept(&prompt)? {
                 handle_rejection(&mut client, &shared_key).await?;
             }
@@ -741,20 +820,32 @@ pub async fn receive(
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
-        let conn = transit::connect_as_receiver(&transit_key, &peer_transit, transit_relay).await?;
+        let conn =
+            transit::connect_as_receiver(&transit_key, &peer_transit, config.transit_relay).await?;
 
-        let mut file = File::create(&output_path).await?;
-        transit::receive_file(&conn, &mut file, file_offer.filesize, hide_progress).await?;
+        if is_compressed {
+            // Receive compressed data, decompress, write to file
+            let compressed_data =
+                transit::receive_to_vec(&conn, file_offer.filesize, config.hide_progress).await?;
+            let decompressed = transit::decompress_zstd(&compressed_data).await?;
+            tokio::fs::write(&output_path, &decompressed).await?;
+        } else {
+            // Receive directly to file
+            let mut file = File::create(&output_path).await?;
+            transit::receive_file(&conn, &mut file, file_offer.filesize, config.hide_progress)
+                .await?;
+        }
 
         println!("Received file: {}", output_path.display());
 
         client.graceful_close(nameplate, Mood::Happy).await;
     } else if let Some(dir_offer) = offer.directory {
-        let output_path = output_dir
+        let output_path = config
+            .output_dir
             .map(|d| d.join(&dir_offer.dirname))
             .unwrap_or_else(|| std::path::PathBuf::from(&dir_offer.dirname));
 
-        if !auto_accept {
+        if !config.auto_accept {
             let prompt = format!(
                 "Receiving directory ({} files, {} bytes): {}",
                 dir_offer.numfiles, dir_offer.numbytes, dir_offer.dirname
@@ -770,10 +861,13 @@ pub async fn receive(
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
-        let conn = transit::connect_as_receiver(&transit_key, &peer_transit, transit_relay).await?;
+        let conn =
+            transit::connect_as_receiver(&transit_key, &peer_transit, config.transit_relay).await?;
 
-        let zip_data = transit::receive_to_vec(&conn, dir_offer.zipsize, hide_progress).await?;
-        transit::extract_zip(&zip_data, &output_path).await?;
+        let zip_data =
+            transit::receive_to_vec(&conn, dir_offer.zipsize, config.hide_progress).await?;
+        let compression = transit::Compression::from_mode(&dir_offer.mode);
+        transit::extract_archive(&zip_data, &output_path, compression).await?;
 
         println!("Received directory: {}", output_path.display());
 

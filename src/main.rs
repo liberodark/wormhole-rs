@@ -1,8 +1,26 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
-use wormhole_rs::{DEFAULT_RELAY_URL, DEFAULT_TRANSIT_RELAY, client, server};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use wormhole_rs::{DEFAULT_RELAY_URL, DEFAULT_TRANSIT_RELAY, client, server, transit};
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum CompressArg {
+    /// Classic zip with deflate (compatible with all clients)
+    #[default]
+    Zip,
+    /// Fast zstd compression (wormhole-rs only)
+    Zstd,
+}
+
+impl From<CompressArg> for transit::Compression {
+    fn from(arg: CompressArg) -> Self {
+        match arg {
+            CompressArg::Zip => transit::Compression::Zip,
+            CompressArg::Zstd => transit::Compression::Zstd,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "wormhole-rs")]
@@ -39,6 +57,9 @@ enum Commands {
 
         #[arg(long)]
         hide_progress: bool,
+
+        #[arg(long, value_enum, default_value = "zip")]
+        compress: CompressArg,
     },
 
     #[command(visible_alias = "recv")]
@@ -110,62 +131,36 @@ async fn main() -> Result<()> {
             transit_relay,
             verify,
             hide_progress,
+            compress,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
 
+            let config = client::SendConfig {
+                relay_url: &relay_url,
+                transit_relay: &transit_relay,
+                code: code.as_deref(),
+                code_length,
+                verify,
+                hide_progress,
+                compression: compress.into(),
+            };
+
             if let Some(text_msg) = text {
-                // Send text
-                client::send_text(
-                    &relay_url,
-                    &transit_relay,
-                    &text_msg,
-                    code.as_deref(),
-                    code_length,
-                    verify,
-                )
-                .await?;
+                client::send_text(&text_msg, &config).await?;
             } else if let Some(file_path) = path {
-                // Send file or directory
                 if file_path.is_dir() {
-                    client::send_directory(
-                        &relay_url,
-                        &transit_relay,
-                        &file_path,
-                        code.as_deref(),
-                        code_length,
-                        verify,
-                        hide_progress,
-                    )
-                    .await?;
+                    client::send_directory(&file_path, &config).await?;
                 } else {
-                    client::send_file(
-                        &relay_url,
-                        &transit_relay,
-                        &file_path,
-                        code.as_deref(),
-                        code_length,
-                        verify,
-                        hide_progress,
-                    )
-                    .await?;
+                    client::send_file(&file_path, &config).await?;
                 }
             } else {
-                // Interactive text input
                 eprint!("Text to send: ");
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 let text_msg = input.trim();
 
-                client::send_text(
-                    &relay_url,
-                    &transit_relay,
-                    text_msg,
-                    code.as_deref(),
-                    code_length,
-                    verify,
-                )
-                .await?;
+                client::send_text(text_msg, &config).await?;
             }
         }
 
@@ -191,16 +186,16 @@ async fn main() -> Result<()> {
                 input.trim().to_string()
             };
 
-            client::receive(
-                &relay_url,
-                &transit_relay,
-                &code,
-                output.as_deref(),
+            let config = client::ReceiveConfig {
+                relay_url: &relay_url,
+                transit_relay: &transit_relay,
+                output_dir: output.as_deref(),
                 verify,
                 hide_progress,
-                accept,
-            )
-            .await?;
+                auto_accept: accept,
+            };
+
+            client::receive(&code, &config).await?;
         }
 
         Commands::Server {

@@ -1,9 +1,9 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -20,6 +20,32 @@ use crate::messages::{TransferAck, Transit, TransitHint};
 
 const RECORD_SIZE: usize = 65536 - 16; // 64KB
 const TCP_BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
+const ZSTD_LEVEL: i32 = 3;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Compression {
+    #[default]
+    /// Classic zip/deflate (compatible with all clients)
+    Zip,
+    /// Fast tar+zstd (wormhole-rs only)
+    Zstd,
+}
+
+impl Compression {
+    pub fn mode_string(&self) -> &'static str {
+        match self {
+            Compression::Zip => "zipfile/deflated",
+            Compression::Zstd => "tarball/zstd",
+        }
+    }
+
+    pub fn from_mode(mode: &str) -> Self {
+        match mode {
+            "tarball/zstd" => Compression::Zstd,
+            _ => Compression::Zip,
+        }
+    }
+}
 
 fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
     if hide_progress {
@@ -412,7 +438,32 @@ pub async fn receive_to_vec(
     Ok(data)
 }
 
-pub async fn create_zip(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
+fn compress_file_sync(path: &Path) -> Result<Vec<u8>> {
+    let data = std::fs::read(path)?;
+    let compressed = zstd::encode_all(std::io::Cursor::new(&data), ZSTD_LEVEL)?;
+    Ok(compressed)
+}
+
+fn decompress_zstd_sync(data: Vec<u8>) -> Result<Vec<u8>> {
+    let decompressed = zstd::decode_all(std::io::Cursor::new(&data))?;
+    Ok(decompressed)
+}
+
+pub async fn compress_file(path: &Path) -> Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || compress_file_sync(&path))
+        .await
+        .context("compress task panicked")?
+}
+
+pub async fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || decompress_zstd_sync(data))
+        .await
+        .context("decompress task panicked")?
+}
+
+fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     use std::io::Cursor;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
@@ -437,10 +488,16 @@ pub async fn create_zip(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
             let entry_path = entry.path();
             let name = entry_path.strip_prefix(prefix)?.to_string_lossy();
 
-            if entry_path.is_dir() {
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            if metadata.is_symlink() {
+                // Handle symlinks
+                let target = std::fs::read_link(&entry_path)?;
+                zip.add_symlink(name.to_string(), target.to_string_lossy(), options)?;
+            } else if metadata.is_dir() {
                 zip.add_directory(format!("{}/", name), options)?;
                 add_dir_to_zip(zip, &entry_path, prefix, options, num_files, num_bytes)?;
-            } else if entry_path.is_file() {
+            } else if metadata.is_file() {
                 zip.start_file(name.to_string(), options)?;
                 let data = std::fs::read(&entry_path)?;
                 *num_bytes += data.len() as u64;
@@ -451,7 +508,8 @@ pub async fn create_zip(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
         Ok(())
     }
 
-    let prefix = path.parent().unwrap_or(path);
+    // Use path itself as prefix so archive contains files directly, not dirname/files
+    let prefix = path;
     add_dir_to_zip(
         &mut zip,
         path,
@@ -467,8 +525,79 @@ pub async fn create_zip(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     Ok((data, num_files, num_bytes))
 }
 
-pub async fn extract_zip(data: &[u8], output_path: &Path) -> Result<()> {
+fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     use std::io::Cursor;
+
+    let mut num_files = 0u64;
+    let mut num_bytes = 0u64;
+
+    // Create tar archive in memory
+    let tar_buffer = Cursor::new(Vec::new());
+    let mut tar_builder = tar::Builder::new(tar_buffer);
+
+    // Don't follow symlinks - preserve them
+    tar_builder.follow_symlinks(false);
+
+    // Recursively add directory contents (not the directory itself)
+    fn add_dir_contents(
+        builder: &mut tar::Builder<Cursor<Vec<u8>>>,
+        dir_path: &Path,
+        prefix: &Path,
+        num_files: &mut u64,
+        num_bytes: &mut u64,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let rel_path = entry_path.strip_prefix(prefix)?;
+
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            if metadata.is_symlink() {
+                // Add symlink
+                let target = std::fs::read_link(&entry_path)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_mtime(
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                header.set_cksum();
+                builder.append_link(&mut header, rel_path, &target)?;
+            } else if metadata.is_dir() {
+                builder.append_dir(rel_path, &entry_path)?;
+                add_dir_contents(builder, &entry_path, prefix, num_files, num_bytes)?;
+            } else if metadata.is_file() {
+                *num_files += 1;
+                *num_bytes += metadata.len();
+                builder.append_path_with_name(&entry_path, rel_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    add_dir_contents(&mut tar_builder, path, path, &mut num_files, &mut num_bytes)?;
+
+    let tar_data = tar_builder.into_inner()?.into_inner();
+
+    // Compress with zstd
+    let compressed = zstd::encode_all(std::io::Cursor::new(&tar_data), ZSTD_LEVEL)?;
+
+    Ok((compressed, num_files, num_bytes))
+}
+
+fn extract_zip_sync(data: Vec<u8>, output_path: &Path) -> Result<()> {
+    use std::io::Cursor;
+    use std::io::Read;
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_path)?;
 
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)?;
@@ -477,21 +606,84 @@ pub async fn extract_zip(data: &[u8], output_path: &Path) -> Result<()> {
         let mut file = archive.by_index(i)?;
         let outpath = output_path.join(file.name());
 
-        if file.name().ends_with('/') {
-            tokio::fs::create_dir_all(&outpath).await?;
-        } else {
+        if file.is_symlink() {
+            // Read symlink target from file content
+            let mut target = String::new();
+            file.read_to_string(&mut target)?;
+
             if let Some(parent) = outpath.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                std::fs::create_dir_all(parent)?;
             }
 
-            let mut outfile = tokio::fs::File::create(&outpath).await?;
-            let mut data = Vec::new();
-            file.read_to_end(&mut data)?;
-            outfile.write_all(&data).await?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &outpath)?;
+
+            #[cfg(windows)]
+            {
+                // On Windows, try to create a symlink (requires privileges)
+                // Fall back to copying if that fails
+                let target_path = outpath.parent().unwrap_or(output_path).join(&target);
+                if target_path.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &outpath).ok();
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &outpath).ok();
+                }
+            }
+        } else if file.name().ends_with('/') {
+            std::fs::create_dir_all(&outpath)?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let mut outfile = std::fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
         }
     }
 
     Ok(())
+}
+
+fn extract_tar_zstd_sync(data: Vec<u8>, output_path: &Path) -> Result<()> {
+    use std::io::Cursor;
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_path)?;
+
+    // Decompress zstd
+    let decompressed = zstd::decode_all(Cursor::new(&data))?;
+
+    // Extract tar
+    let cursor = Cursor::new(decompressed);
+    let mut archive = tar::Archive::new(cursor);
+    archive.unpack(output_path)?;
+
+    Ok(())
+}
+
+pub async fn create_archive(path: &Path, compression: Compression) -> Result<(Vec<u8>, u64, u64)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || match compression {
+        Compression::Zip => create_zip_sync(&path),
+        Compression::Zstd => create_tar_zstd_sync(&path),
+    })
+    .await
+    .context("archive task panicked")?
+}
+
+pub async fn extract_archive(
+    data: &[u8],
+    output_path: &Path,
+    compression: Compression,
+) -> Result<()> {
+    let data = data.to_vec();
+    let output_path = output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || match compression {
+        Compression::Zip => extract_zip_sync(data, &output_path),
+        Compression::Zstd => extract_tar_zstd_sync(data, &output_path),
+    })
+    .await
+    .context("extract task panicked")?
 }
 
 #[cfg(test)]
@@ -502,5 +694,18 @@ mod tests {
     fn test_record_size() {
         assert!(RECORD_SIZE > 0);
         assert!(RECORD_SIZE <= 65536);
+    }
+
+    #[test]
+    fn test_compression_mode_string() {
+        assert_eq!(Compression::Zip.mode_string(), "zipfile/deflated");
+        assert_eq!(Compression::Zstd.mode_string(), "tarball/zstd");
+    }
+
+    #[test]
+    fn test_compression_from_mode() {
+        assert_eq!(Compression::from_mode("zipfile/deflated"), Compression::Zip);
+        assert_eq!(Compression::from_mode("tarball/zstd"), Compression::Zstd);
+        assert_eq!(Compression::from_mode("unknown"), Compression::Zip);
     }
 }
