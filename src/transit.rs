@@ -9,6 +9,7 @@ use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
+use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -21,7 +22,10 @@ use crate::messages::{TransferAck, Transit, TransitHint};
 
 const RECORD_SIZE: usize = 65536 - 16; // 64KB
 const TCP_BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
-const ZSTD_LEVEL: i32 = 3;
+const ZSTD_LEVEL: i32 = 3; // Fast compression
+
+const MEMORY_SAFETY_FACTOR: f64 = 0.5;
+const MIN_AVAILABLE_RAM: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Compression {
@@ -46,6 +50,72 @@ impl Compression {
             _ => Compression::Zip,
         }
     }
+}
+
+/// Source of archive data - either in memory or in a temporary file
+pub enum ArchiveSource {
+    /// Archive data stored in memory
+    Memory(Vec<u8>),
+    /// Archive data stored in a temporary file (auto-deleted on drop)
+    TempFile(tempfile::NamedTempFile),
+}
+
+impl ArchiveSource {
+    /// Get the size of the archive data
+    pub fn size(&self) -> Result<u64> {
+        match self {
+            ArchiveSource::Memory(data) => Ok(data.len() as u64),
+            ArchiveSource::TempFile(file) => Ok(file.as_file().metadata()?.len()),
+        }
+    }
+}
+
+/// Result of creating an archive
+pub struct ArchiveResult {
+    /// The archive data source
+    pub source: ArchiveSource,
+    /// Number of files in the archive
+    pub num_files: u64,
+    /// Total uncompressed size of files
+    pub num_bytes: u64,
+}
+
+/// Calculate total size of a directory recursively
+fn calculate_dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if let Ok(metadata) = std::fs::symlink_metadata(&entry_path) {
+                if metadata.is_file() {
+                    total += metadata.len();
+                } else if metadata.is_dir() {
+                    total += calculate_dir_size(&entry_path);
+                }
+            }
+        }
+    }
+
+    total
+}
+
+/// Get available system memory in bytes
+fn get_available_memory() -> u64 {
+    let sys = System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+    );
+    sys.available_memory()
+}
+
+/// Determine if we should use a temporary file for archiving
+fn should_use_tempfile(dir_size: u64) -> bool {
+    let available = get_available_memory();
+
+    // Use tempfile if:
+    // 1. Not enough available RAM (below minimum threshold)
+    // 2. Directory size exceeds safety factor of available RAM
+    available < MIN_AVAILABLE_RAM || dir_size > (available as f64 * MEMORY_SAFETY_FACTOR) as u64
 }
 
 fn create_progress_bar(total_size: u64, hide_progress: bool) -> ProgressBar {
@@ -163,27 +233,25 @@ fn get_local_ips() -> Vec<std::net::IpAddr> {
     let mut ips = Vec::new();
 
     // Try to get IPs by connecting to a public address (doesn't actually connect)
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        // Connect to Google DNS to determine local IP (no actual traffic sent)
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                ips.push(addr.ip());
-            }
-        }
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        ips.push(addr.ip());
     }
 
     // Also try IPv6
-    if let Ok(socket) = std::net::UdpSocket::bind("[::]:0") {
-        if socket.connect("[2001:4860:4860::8888]:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                // Skip link-local IPv6
-                if let std::net::IpAddr::V6(v6) = ip {
-                    if !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 {
-                        ips.push(ip);
-                    }
-                }
-            }
+    if let Ok(socket) = std::net::UdpSocket::bind("[::]:0")
+        && socket.connect("[2001:4860:4860::8888]:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        let ip = addr.ip();
+        // Skip link-local IPv6
+        if let std::net::IpAddr::V6(v6) = ip
+            && !v6.is_loopback()
+            && (v6.segments()[0] & 0xffc0) != 0xfe80
+        {
+            ips.push(ip);
         }
     }
 
@@ -318,10 +386,10 @@ pub async fn connect_as_sender(
         async move {
             if let Some(listener) = listener {
                 let result = listener.accept_as_sender(&transit_key).await;
-                if result.is_ok() {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                if result.is_ok()
+                    && let Some(tx) = done_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
                 }
                 result
             } else {
@@ -357,10 +425,10 @@ pub async fn connect_as_sender(
             // Small delay to prefer direct connections
             tokio::time::sleep(Duration::from_millis(500)).await;
             let result = connect_via_relay_sender(&transit_key, &relay_addr, timeout).await;
-            if result.is_ok() {
-                if let Some(tx) = done_tx.lock().unwrap().take() {
-                    let _ = tx.send(());
-                }
+            if result.is_ok()
+                && let Some(tx) = done_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
             }
             result
         }
@@ -380,7 +448,7 @@ pub async fn connect_as_sender(
     .await
     .context("Transit connection timed out")?;
 
-    result.map(|conn| Arc::new(conn))
+    result.map(Arc::new)
 }
 
 pub async fn connect_as_receiver(
@@ -414,10 +482,10 @@ pub async fn connect_as_receiver(
         async move {
             if let Some(listener) = listener {
                 let result = listener.accept_as_receiver(&transit_key).await;
-                if result.is_ok() {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                if result.is_ok()
+                    && let Some(tx) = done_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
                 }
                 result
             } else {
@@ -447,12 +515,13 @@ pub async fn connect_as_receiver(
         let relay_addr = relay_addr.to_string();
         let done_tx = Arc::clone(&done_tx);
         async move {
+            // Small delay to prefer direct connections
             tokio::time::sleep(Duration::from_millis(500)).await;
             let result = connect_via_relay_receiver(&transit_key, &relay_addr, timeout).await;
-            if result.is_ok() {
-                if let Some(tx) = done_tx.lock().unwrap().take() {
-                    let _ = tx.send(());
-                }
+            if result.is_ok()
+                && let Some(tx) = done_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
             }
             result
         }
@@ -471,7 +540,7 @@ pub async fn connect_as_receiver(
     .await
     .context("Transit connection timed out")?;
 
-    result.map(|conn| Arc::new(conn))
+    result.map(Arc::new)
 }
 
 async fn try_connect_direct_sender(
@@ -722,27 +791,164 @@ pub async fn receive_to_vec(
     Ok(data)
 }
 
+/// Receive data to a temporary file (for large transfers)
+pub async fn receive_to_tempfile(
+    conn: &Arc<TransitConnection>,
+    total_size: u64,
+    hide_progress: bool,
+) -> Result<tempfile::NamedTempFile> {
+    use tokio::io::AsyncWriteExt;
+
+    let temp_file = tempfile::NamedTempFile::new()?;
+    let mut file = tokio::fs::File::create(temp_file.path()).await?;
+    let mut hasher = Sha256::new();
+    let mut received = 0u64;
+
+    let progress = create_progress_bar(total_size, hide_progress);
+
+    while received < total_size {
+        let chunk = conn.read_record().await?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+        received += chunk.len() as u64;
+        progress.set_position(received);
+    }
+
+    file.flush().await?;
+    progress.finish_and_clear();
+
+    let hash = hex::encode(hasher.finalize());
+    let ack = TransferAck {
+        ack: "ok".to_string(),
+        sha256: hash,
+    };
+    let ack_data = serde_json::to_vec(&ack)?;
+    conn.write_record(&ack_data).await?;
+    conn.flush().await?;
+
+    Ok(temp_file)
+}
+
+/// Result of receiving data - either in memory or in a temporary file
+pub enum ReceivedData {
+    /// Data stored in memory
+    Memory(Vec<u8>),
+    /// Data stored in a temporary file
+    TempFile(tempfile::NamedTempFile),
+}
+
+/// Receive data (memory-aware)
+///
+/// Automatically chooses between in-memory and tempfile based on available RAM.
+pub async fn receive_data(
+    conn: &Arc<TransitConnection>,
+    total_size: u64,
+    hide_progress: bool,
+) -> Result<ReceivedData> {
+    if should_use_tempfile(total_size) {
+        let temp_file = receive_to_tempfile(conn, total_size, hide_progress).await?;
+        Ok(ReceivedData::TempFile(temp_file))
+    } else {
+        let data = receive_to_vec(conn, total_size, hide_progress).await?;
+        Ok(ReceivedData::Memory(data))
+    }
+}
+
+/// Compress a file with zstd (in memory)
 fn compress_file_sync(path: &Path) -> Result<Vec<u8>> {
     let data = std::fs::read(path)?;
     let compressed = zstd::encode_all(std::io::Cursor::new(&data), ZSTD_LEVEL)?;
     Ok(compressed)
 }
 
+/// Compress a file with zstd to a temporary file (for large files)
+fn compress_file_to_tempfile_sync(path: &Path) -> Result<tempfile::NamedTempFile> {
+    use std::io::BufReader;
+
+    let input = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(input);
+
+    let temp_file = tempfile::NamedTempFile::new()?;
+    let mut encoder = zstd::Encoder::new(temp_file.reopen()?, ZSTD_LEVEL)?;
+
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+
+    Ok(temp_file)
+}
+
+/// Decompress zstd data
 fn decompress_zstd_sync(data: Vec<u8>) -> Result<Vec<u8>> {
     let decompressed = zstd::decode_all(std::io::Cursor::new(&data))?;
     Ok(decompressed)
 }
 
-pub async fn compress_file(path: &Path) -> Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || compress_file_sync(&path))
-        .await
-        .context("compress task panicked")?
+/// Result of compressing a file
+pub enum CompressedFile {
+    /// Compressed data in memory
+    Memory(Vec<u8>),
+    /// Compressed data in a temporary file
+    TempFile(tempfile::NamedTempFile),
 }
 
+impl CompressedFile {
+    /// Get the size of the compressed data
+    pub fn size(&self) -> Result<u64> {
+        match self {
+            CompressedFile::Memory(data) => Ok(data.len() as u64),
+            CompressedFile::TempFile(file) => Ok(file.as_file().metadata()?.len()),
+        }
+    }
+}
+
+/// Compress a file (memory-aware)
+///
+/// Automatically chooses between in-memory and tempfile based on available RAM.
+pub async fn compress_file(path: &Path) -> Result<CompressedFile> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file_size = std::fs::metadata(&path)?.len();
+
+        if should_use_tempfile(file_size) {
+            // Large file - compress to tempfile
+            let temp_file = compress_file_to_tempfile_sync(&path)?;
+            Ok(CompressedFile::TempFile(temp_file))
+        } else {
+            // Small enough - compress in memory
+            let data = compress_file_sync(&path)?;
+            Ok(CompressedFile::Memory(data))
+        }
+    })
+    .await
+    .context("compress task panicked")?
+}
+
+/// Decompress zstd data (async wrapper)
 pub async fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     let data = data.to_vec();
     tokio::task::spawn_blocking(move || decompress_zstd_sync(data))
+        .await
+        .context("decompress task panicked")?
+}
+
+/// Decompress zstd from file to file (streaming, memory-efficient)
+fn decompress_zstd_file_to_file_sync(input: &Path, output: &Path) -> Result<()> {
+    use std::io::BufReader;
+
+    let input_file = std::fs::File::open(input)?;
+    let mut decoder = zstd::Decoder::new(BufReader::new(input_file))?;
+
+    let mut output_file = std::fs::File::create(output)?;
+    std::io::copy(&mut decoder, &mut output_file)?;
+
+    Ok(())
+}
+
+/// Decompress zstd from file to file (async wrapper)
+pub async fn decompress_zstd_file_to_file(input: &Path, output: &Path) -> Result<()> {
+    let input = input.to_path_buf();
+    let output = output.to_path_buf();
+    tokio::task::spawn_blocking(move || decompress_zstd_file_to_file_sync(&input, &output))
         .await
         .context("decompress task panicked")?
 }
@@ -807,6 +1013,67 @@ fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     let data = buffer.into_inner();
 
     Ok((data, num_files, num_bytes))
+}
+
+/// Create zip archive to a temporary file (for large directories)
+fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, u64, u64)> {
+    use std::io::BufWriter;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let temp_file = tempfile::NamedTempFile::new()?;
+    let mut zip = ZipWriter::new(BufWriter::new(temp_file.reopen()?));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut num_files = 0u64;
+    let mut num_bytes = 0u64;
+
+    fn add_dir_to_zip_file<W: Write + std::io::Seek>(
+        zip: &mut ZipWriter<W>,
+        path: &Path,
+        prefix: &Path,
+        options: SimpleFileOptions,
+        num_files: &mut u64,
+        num_bytes: &mut u64,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let name = entry_path.strip_prefix(prefix)?.to_string_lossy();
+
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            if metadata.is_symlink() {
+                let target = std::fs::read_link(&entry_path)?;
+                zip.add_symlink(name.to_string(), target.to_string_lossy(), options)?;
+            } else if metadata.is_dir() {
+                zip.add_directory(format!("{}/", name), options)?;
+                add_dir_to_zip_file(zip, &entry_path, prefix, options, num_files, num_bytes)?;
+            } else if metadata.is_file() {
+                zip.start_file(name.to_string(), options)?;
+                // Stream file content instead of loading all at once
+                let mut file = std::fs::File::open(&entry_path)?;
+                let file_size = std::io::copy(&mut file, zip)?;
+                *num_bytes += file_size;
+                *num_files += 1;
+            }
+        }
+        Ok(())
+    }
+
+    let prefix = path;
+    add_dir_to_zip_file(
+        &mut zip,
+        path,
+        prefix,
+        options,
+        &mut num_files,
+        &mut num_bytes,
+    )?;
+
+    zip.finish()?;
+
+    Ok((temp_file, num_files, num_bytes))
 }
 
 fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
@@ -874,6 +1141,73 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
     let compressed = zstd::encode_all(std::io::Cursor::new(&tar_data), ZSTD_LEVEL)?;
 
     Ok((compressed, num_files, num_bytes))
+}
+
+/// Create tar+zstd archive to a temporary file (for large directories)
+fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, u64, u64)> {
+    use std::io::BufWriter;
+
+    let mut num_files = 0u64;
+    let mut num_bytes = 0u64;
+
+    // Create temporary file for the compressed output
+    let temp_file = tempfile::NamedTempFile::new()?;
+    let zstd_writer = zstd::Encoder::new(BufWriter::new(temp_file.reopen()?), ZSTD_LEVEL)?;
+    let mut tar_builder = tar::Builder::new(zstd_writer);
+
+    // Don't follow symlinks - preserve them
+    tar_builder.follow_symlinks(false);
+
+    // Recursively add directory contents
+    fn add_dir_contents_to_tar<W: Write>(
+        builder: &mut tar::Builder<W>,
+        dir_path: &Path,
+        prefix: &Path,
+        num_files: &mut u64,
+        num_bytes: &mut u64,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let rel_path = entry_path.strip_prefix(prefix)?;
+
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            if metadata.is_symlink() {
+                let target = std::fs::read_link(&entry_path)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_mtime(
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                header.set_cksum();
+                builder.append_link(&mut header, rel_path, &target)?;
+            } else if metadata.is_dir() {
+                builder.append_dir(rel_path, &entry_path)?;
+                add_dir_contents_to_tar(builder, &entry_path, prefix, num_files, num_bytes)?;
+            } else if metadata.is_file() {
+                *num_files += 1;
+                *num_bytes += metadata.len();
+                builder.append_path_with_name(&entry_path, rel_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    add_dir_contents_to_tar(&mut tar_builder, path, path, &mut num_files, &mut num_bytes)?;
+
+    // Finish tar and zstd compression
+    let zstd_writer = tar_builder.into_inner()?;
+    zstd_writer.finish()?;
+
+    Ok((temp_file, num_files, num_bytes))
 }
 
 fn extract_zip_sync(data: Vec<u8>, output_path: &Path) -> Result<()> {
@@ -945,11 +1279,119 @@ fn extract_tar_zstd_sync(data: Vec<u8>, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn create_archive(path: &Path, compression: Compression) -> Result<(Vec<u8>, u64, u64)> {
+/// Extract zip archive from a file (streaming, memory-efficient)
+fn extract_zip_from_file_sync(archive_path: &Path, output_path: &Path) -> Result<()> {
+    use std::io::Read;
+
+    std::fs::create_dir_all(output_path)?;
+
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let outpath = output_path.join(file.name());
+
+        if file.is_symlink() {
+            let mut target = String::new();
+            file.read_to_string(&mut target)?;
+
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &outpath)?;
+
+            #[cfg(windows)]
+            {
+                let target_path = outpath.parent().unwrap_or(output_path).join(&target);
+                if target_path.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &outpath).ok();
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &outpath).ok();
+                }
+            }
+        } else if file.name().ends_with('/') {
+            std::fs::create_dir_all(&outpath)?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let mut outfile = std::fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract tar+zstd archive from a file (streaming, memory-efficient)
+fn extract_tar_zstd_from_file_sync(archive_path: &Path, output_path: &Path) -> Result<()> {
+    use std::io::BufReader;
+
+    std::fs::create_dir_all(output_path)?;
+
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = zstd::Decoder::new(BufReader::new(file))?;
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(output_path)?;
+
+    Ok(())
+}
+
+/// Create archive from directory (memory-aware)
+///
+/// Automatically chooses between in-memory and tempfile based on available RAM.
+/// This prevents OOM crashes when archiving large directories.
+pub async fn create_archive(path: &Path, compression: Compression) -> Result<ArchiveResult> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || match compression {
-        Compression::Zip => create_zip_sync(&path),
-        Compression::Zstd => create_tar_zstd_sync(&path),
+    tokio::task::spawn_blocking(move || {
+        let dir_size = calculate_dir_size(&path);
+        let use_tempfile = should_use_tempfile(dir_size);
+
+        match compression {
+            Compression::Zip => {
+                if use_tempfile {
+                    // Large directory - use tempfile to avoid OOM
+                    let (temp_file, num_files, num_bytes) = create_zip_to_tempfile_sync(&path)?;
+                    Ok(ArchiveResult {
+                        source: ArchiveSource::TempFile(temp_file),
+                        num_files,
+                        num_bytes,
+                    })
+                } else {
+                    // Small enough - use memory (faster)
+                    let (data, num_files, num_bytes) = create_zip_sync(&path)?;
+                    Ok(ArchiveResult {
+                        source: ArchiveSource::Memory(data),
+                        num_files,
+                        num_bytes,
+                    })
+                }
+            }
+            Compression::Zstd => {
+                if use_tempfile {
+                    // Large directory - use tempfile to avoid OOM
+                    let (temp_file, num_files, num_bytes) =
+                        create_tar_zstd_to_tempfile_sync(&path)?;
+                    Ok(ArchiveResult {
+                        source: ArchiveSource::TempFile(temp_file),
+                        num_files,
+                        num_bytes,
+                    })
+                } else {
+                    // Small enough - use memory (faster)
+                    let (data, num_files, num_bytes) = create_tar_zstd_sync(&path)?;
+                    Ok(ArchiveResult {
+                        source: ArchiveSource::Memory(data),
+                        num_files,
+                        num_bytes,
+                    })
+                }
+            }
+        }
     })
     .await
     .context("archive task panicked")?
@@ -965,6 +1407,22 @@ pub async fn extract_archive(
     tokio::task::spawn_blocking(move || match compression {
         Compression::Zip => extract_zip_sync(data, &output_path),
         Compression::Zstd => extract_tar_zstd_sync(data, &output_path),
+    })
+    .await
+    .context("extract task panicked")?
+}
+
+/// Extract archive from file to directory (streaming, memory-efficient)
+pub async fn extract_archive_from_file(
+    archive_path: &Path,
+    output_path: &Path,
+    compression: Compression,
+) -> Result<()> {
+    let archive_path = archive_path.to_path_buf();
+    let output_path = output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || match compression {
+        Compression::Zip => extract_zip_from_file_sync(&archive_path, &output_path),
+        Compression::Zstd => extract_tar_zstd_from_file_sync(&archive_path, &output_path),
     })
     .await
     .context("extract task panicked")?
@@ -1015,5 +1473,43 @@ mod tests {
             assert_eq!(hint.hint_type, "direct-tcp-v1");
             assert!(hint.port.unwrap() > 0);
         }
+    }
+
+    #[test]
+    fn test_get_available_memory() {
+        let mem = get_available_memory();
+        // Should have at least some memory available
+        assert!(mem > 0);
+    }
+
+    #[test]
+    fn test_should_use_tempfile() {
+        // Very small size should use memory
+        assert!(!should_use_tempfile(1024));
+
+        // Very large size should use tempfile
+        assert!(should_use_tempfile(100 * 1024 * 1024 * 1024)); // 100 GB
+    }
+
+    #[test]
+    fn test_calculate_dir_size() {
+        // Create temp dir with some files
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let size = calculate_dir_size(temp_dir.path());
+        assert!(size >= 11); // "hello world" = 11 bytes
+    }
+
+    #[tokio::test]
+    async fn test_compress_file_small() {
+        // Small file should use memory
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("small.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let result = compress_file(&file_path).await.unwrap();
+        assert!(matches!(result, CompressedFile::Memory(_)));
     }
 }

@@ -671,6 +671,16 @@ pub async fn send_text(text: &str, config: &SendConfig<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Source of file data for sending
+enum FileSource {
+    /// Original file (no compression)
+    Original,
+    /// Compressed data in memory
+    CompressedMemory(Vec<u8>),
+    /// Compressed data in a temporary file
+    CompressedTempFile(tempfile::NamedTempFile),
+}
+
 /// Send a file through the wormhole
 pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     let metadata = tokio::fs::metadata(path).await?;
@@ -682,13 +692,23 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     let original_size = metadata.len();
 
     // Prepare file data based on compression
-    let (data, filename, filesize, mode, orig_size) = match config.compression {
+    let (source, filename, filesize, mode, orig_size) = match config.compression {
         transit::Compression::Zstd => {
             let compressed = transit::compress_file(path).await?;
-            let compressed_size = compressed.len() as u64;
+            let compressed_size = compressed.size()?;
+            let (source, filename) = match compressed {
+                transit::CompressedFile::Memory(data) => (
+                    FileSource::CompressedMemory(data),
+                    format!("{}.zst", original_filename),
+                ),
+                transit::CompressedFile::TempFile(temp) => (
+                    FileSource::CompressedTempFile(temp),
+                    format!("{}.zst", original_filename),
+                ),
+            };
             (
-                Some(compressed),
-                format!("{}.zst", original_filename),
+                source,
+                filename,
                 compressed_size,
                 Some("zstd".to_string()),
                 Some(original_size),
@@ -696,7 +716,13 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
         }
         transit::Compression::Zip => {
             // No compression for single files in zip mode
-            (None, original_filename, original_size, None, None)
+            (
+                FileSource::Original,
+                original_filename,
+                original_size,
+                None,
+                None,
+            )
         }
     };
 
@@ -737,14 +763,21 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     )
     .await?;
 
-    if let Some(compressed_data) = data {
-        // Send compressed data from memory
-        let mut cursor = std::io::Cursor::new(compressed_data);
-        transit::send_file(&conn, &mut cursor, filesize, config.hide_progress).await?;
-    } else {
-        // Send file directly
-        let mut file = File::open(path).await?;
-        transit::send_file(&conn, &mut file, filesize, config.hide_progress).await?;
+    // Send file data from appropriate source
+    match source {
+        FileSource::Original => {
+            let mut file = File::open(path).await?;
+            transit::send_file(&conn, &mut file, filesize, config.hide_progress).await?;
+        }
+        FileSource::CompressedMemory(data) => {
+            let mut cursor = std::io::Cursor::new(data);
+            transit::send_file(&conn, &mut cursor, filesize, config.hide_progress).await?;
+        }
+        FileSource::CompressedTempFile(temp_file) => {
+            let mut file = File::open(temp_file.path()).await?;
+            transit::send_file(&conn, &mut file, filesize, config.hide_progress).await?;
+            // temp_file is dropped here, auto-deletes
+        }
     }
 
     println!("file sent");
@@ -756,14 +789,15 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
 
 /// Send a directory through the wormhole
 pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> {
-    let (zip_data, num_files, num_bytes) =
-        transit::create_archive(path, config.compression).await?;
+    let archive = transit::create_archive(path, config.compression).await?;
     let dirname = path
         .file_name()
         .context("Invalid directory name")?
         .to_string_lossy()
         .to_string();
-    let zipsize = zip_data.len() as u64;
+    let zipsize = archive.source.size()?;
+    let num_files = archive.num_files;
+    let num_bytes = archive.num_bytes;
 
     let mut client = RendezvousClient::connect(config.relay_url, config.connect_timeout).await?;
     client.bind().await?;
@@ -802,8 +836,18 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
     )
     .await?;
 
-    let mut cursor = std::io::Cursor::new(zip_data);
-    transit::send_file(&conn, &mut cursor, zipsize, config.hide_progress).await?;
+    // Send archive data from appropriate source
+    match archive.source {
+        transit::ArchiveSource::Memory(data) => {
+            let mut cursor = std::io::Cursor::new(data);
+            transit::send_file(&conn, &mut cursor, zipsize, config.hide_progress).await?;
+        }
+        transit::ArchiveSource::TempFile(temp_file) => {
+            let mut file = File::open(temp_file.path()).await?;
+            transit::send_file(&conn, &mut file, zipsize, config.hide_progress).await?;
+            // temp_file is dropped here, auto-deletes the file
+        }
+    }
 
     println!("directory sent");
 
@@ -922,13 +966,19 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         .await?;
 
         if is_compressed {
-            // Receive compressed data, decompress, write to file
-            let compressed_data =
-                transit::receive_to_vec(&conn, file_offer.filesize, config.hide_progress).await?;
-            let decompressed = transit::decompress_zstd(&compressed_data).await?;
-            tokio::fs::write(&output_path, &decompressed).await?;
+            let received =
+                transit::receive_data(&conn, file_offer.filesize, config.hide_progress).await?;
+
+            match received {
+                transit::ReceivedData::Memory(compressed_data) => {
+                    let decompressed = transit::decompress_zstd(&compressed_data).await?;
+                    tokio::fs::write(&output_path, &decompressed).await?;
+                }
+                transit::ReceivedData::TempFile(temp_file) => {
+                    transit::decompress_zstd_file_to_file(temp_file.path(), &output_path).await?;
+                }
+            }
         } else {
-            // Receive directly to file
             let mut file = File::create(&output_path).await?;
             transit::receive_file(&conn, &mut file, file_offer.filesize, config.hide_progress)
                 .await?;
@@ -975,10 +1025,24 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         )
         .await?;
 
-        let zip_data =
-            transit::receive_to_vec(&conn, dir_offer.zipsize, config.hide_progress).await?;
         let compression = transit::Compression::from_mode(&dir_offer.mode);
-        transit::extract_archive(&zip_data, &output_path, compression).await?;
+
+        // Receive archive data (memory-aware)
+        let received =
+            transit::receive_data(&conn, dir_offer.zipsize, config.hide_progress).await?;
+
+        match received {
+            transit::ReceivedData::Memory(data) => {
+                // Small enough - extract from memory
+                transit::extract_archive(&data, &output_path, compression).await?;
+            }
+            transit::ReceivedData::TempFile(temp_file) => {
+                // Large archive - extract from tempfile (streaming)
+                transit::extract_archive_from_file(temp_file.path(), &output_path, compression)
+                    .await?;
+                // temp_file auto-deleted on drop
+            }
+        }
 
         println!("Received directory: {}", output_path.display());
 

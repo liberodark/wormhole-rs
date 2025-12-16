@@ -28,9 +28,8 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 tar = "0.4"
 zstd = "0.13"
 indicatif = "0.18"
-
-[dev-dependencies]
-tempfile = "3.23"
+sysinfo = "0.35"
+tempfile = "3.20"
 
 [profile.release]
 lto = true
