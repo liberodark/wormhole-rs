@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -60,6 +61,12 @@ enum Commands {
 
         #[arg(long, value_enum, default_value = "zip")]
         compress: CompressArg,
+
+        #[arg(long, default_value = "30")]
+        connect_timeout: u64,
+
+        #[arg(long, default_value = "300")]
+        peer_timeout: u64,
     },
 
     #[command(visible_alias = "recv")]
@@ -84,6 +91,12 @@ enum Commands {
 
         #[arg(long, short = 'y')]
         accept: bool,
+
+        #[arg(long, default_value = "30")]
+        connect_timeout: u64,
+
+        #[arg(long, default_value = "300")]
+        peer_timeout: u64,
     },
 
     /// Run as a relay server
@@ -132,6 +145,8 @@ async fn main() -> Result<()> {
             verify,
             hide_progress,
             compress,
+            connect_timeout,
+            peer_timeout,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
@@ -144,6 +159,12 @@ async fn main() -> Result<()> {
                 verify,
                 hide_progress,
                 compression: compress.into(),
+                connect_timeout: Duration::from_secs(connect_timeout),
+                peer_timeout: if peer_timeout == 0 {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(peer_timeout)
+                },
             };
 
             if let Some(text_msg) = text {
@@ -172,6 +193,8 @@ async fn main() -> Result<()> {
             verify,
             hide_progress,
             accept,
+            connect_timeout,
+            peer_timeout,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
@@ -193,6 +216,12 @@ async fn main() -> Result<()> {
                 verify,
                 hide_progress,
                 auto_accept: accept,
+                connect_timeout: Duration::from_secs(connect_timeout),
+                peer_timeout: if peer_timeout == 0 {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(peer_timeout)
+                },
             };
 
             client::receive(&code, &config).await?;

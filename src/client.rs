@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +19,9 @@ use crate::transit;
 use crate::wordlist;
 use crate::{AGENT_STRING, AGENT_VERSION, APP_ID, DEFAULT_RELAY_URL, DEFAULT_TRANSIT_RELAY};
 
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
 pub struct SendConfig<'a> {
     pub relay_url: &'a str,
     pub transit_relay: &'a str,
@@ -26,6 +30,8 @@ pub struct SendConfig<'a> {
     pub verify: bool,
     pub hide_progress: bool,
     pub compression: transit::Compression,
+    pub connect_timeout: Duration,
+    pub peer_timeout: Duration,
 }
 
 impl Default for SendConfig<'_> {
@@ -38,6 +44,8 @@ impl Default for SendConfig<'_> {
             verify: false,
             hide_progress: false,
             compression: transit::Compression::Zip,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            peer_timeout: DEFAULT_PEER_TIMEOUT,
         }
     }
 }
@@ -49,6 +57,8 @@ pub struct ReceiveConfig<'a> {
     pub verify: bool,
     pub hide_progress: bool,
     pub auto_accept: bool,
+    pub connect_timeout: Duration,
+    pub peer_timeout: Duration,
 }
 
 impl Default for ReceiveConfig<'_> {
@@ -60,6 +70,8 @@ impl Default for ReceiveConfig<'_> {
             verify: false,
             hide_progress: false,
             auto_accept: false,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            peer_timeout: DEFAULT_PEER_TIMEOUT,
         }
     }
 }
@@ -210,9 +222,11 @@ struct RendezvousClient {
 }
 
 impl RendezvousClient {
-    async fn connect(relay_url: &str) -> Result<Self> {
-        let (ws_stream, _) = connect_async(relay_url)
+    async fn connect(relay_url: &str, timeout: Duration) -> Result<Self> {
+        let connect_future = connect_async(relay_url);
+        let (ws_stream, _) = tokio::time::timeout(timeout, connect_future)
             .await
+            .context("Connection timed out")?
             .context("Failed to connect to relay server")?;
 
         let (ws_sender, ws_receiver) = ws_stream.split();
@@ -416,7 +430,7 @@ impl RendezvousClient {
     }
 }
 
-async fn do_pake(client: &mut RendezvousClient, code: &str) -> Result<Vec<u8>> {
+async fn do_pake(client: &mut RendezvousClient, code: &str, timeout: Duration) -> Result<Vec<u8>> {
     let (spake, outbound) = SpakeState::new(code, APP_ID);
 
     let pake_msg = PakeMsg {
@@ -426,21 +440,31 @@ async fn do_pake(client: &mut RendezvousClient, code: &str) -> Result<Vec<u8>> {
     let pake_hex = hex::encode(pake_json.as_bytes());
     client.add("pake", &pake_hex).await?;
 
-    loop {
-        let msg = client.recv_message().await?;
-        if msg.phase == "pake" && msg.side != client.side_id {
-            let pake_bytes = hex::decode(&msg.body)?;
-            let pake_json = String::from_utf8(pake_bytes)?;
-            let peer_pake: PakeMsg = serde_json::from_str(&pake_json)?;
-            let peer_msg = hex::decode(&peer_pake.pake_v1)?;
+    let wait_for_peer = async {
+        loop {
+            let msg = client.recv_message().await?;
+            if msg.phase == "pake" && msg.side != client.side_id {
+                let pake_bytes = hex::decode(&msg.body)?;
+                let pake_json = String::from_utf8(pake_bytes)?;
+                let peer_pake: PakeMsg = serde_json::from_str(&pake_json)?;
+                let peer_msg = hex::decode(&peer_pake.pake_v1)?;
 
-            let shared_key = spake.finish(&peer_msg)?;
-            return Ok(shared_key);
+                let shared_key = spake.finish(&peer_msg)?;
+                return Ok(shared_key);
+            }
         }
-    }
+    };
+
+    tokio::time::timeout(timeout, wait_for_peer)
+        .await
+        .context("Timed out waiting for peer to enter code")?
 }
 
-async fn exchange_versions(client: &mut RendezvousClient, shared_key: &[u8]) -> Result<()> {
+async fn exchange_versions(
+    client: &mut RendezvousClient,
+    shared_key: &[u8],
+    timeout: Duration,
+) -> Result<()> {
     let versions = GenericMessage {
         offer: None,
         answer: None,
@@ -459,13 +483,19 @@ async fn exchange_versions(client: &mut RendezvousClient, shared_key: &[u8]) -> 
     )?;
     client.add("version", &encrypted).await?;
 
-    loop {
-        let msg = client.recv_message().await?;
-        if msg.phase == "version" && msg.side != client.side_id {
-            let _ = decrypt_message(shared_key, &msg.side, "version", &msg.body)?;
-            return Ok(());
+    let wait_for_peer = async {
+        loop {
+            let msg = client.recv_message().await?;
+            if msg.phase == "version" && msg.side != client.side_id {
+                let _ = decrypt_message(shared_key, &msg.side, "version", &msg.body)?;
+                return Ok(());
+            }
         }
-    }
+    };
+
+    tokio::time::timeout(timeout, wait_for_peer)
+        .await
+        .context("Timed out waiting for peer version exchange")?
 }
 
 async fn send_app_data(
@@ -497,6 +527,16 @@ async fn recv_app_data(
             return Ok((msg.phase, data));
         }
     }
+}
+
+async fn recv_app_data_timeout(
+    client: &mut RendezvousClient,
+    shared_key: &[u8],
+    timeout: Duration,
+) -> Result<(String, GenericMessage)> {
+    tokio::time::timeout(timeout, recv_app_data(client, shared_key))
+        .await
+        .context("Timed out waiting for peer response")?
 }
 
 /// Allocate or use provided code, claim mailbox, print instructions
@@ -549,29 +589,39 @@ async fn verify_key(
 }
 
 /// Wait for peer transit hints and file acknowledgment
-async fn wait_for_transit_ack(client: &mut RendezvousClient, shared_key: &[u8]) -> Result<Transit> {
-    let mut peer_transit = None;
-    let mut answer_received = false;
+async fn wait_for_transit_ack(
+    client: &mut RendezvousClient,
+    shared_key: &[u8],
+    timeout: Duration,
+) -> Result<Transit> {
+    let wait_for_peer = async {
+        let mut peer_transit = None;
+        let mut answer_received = false;
 
-    while !answer_received || peer_transit.is_none() {
-        let (_, msg) = recv_app_data(client, shared_key).await?;
+        while !answer_received || peer_transit.is_none() {
+            let (_, msg) = recv_app_data(client, shared_key).await?;
 
-        if let Some(err) = msg.error {
-            anyhow::bail!("Transfer error: {}", err);
+            if let Some(err) = msg.error {
+                anyhow::bail!("Transfer error: {}", err);
+            }
+
+            if let Some(t) = msg.transit {
+                peer_transit = Some(t);
+            }
+
+            if let Some(ans) = msg.answer
+                && ans.file_ack == Some("ok".to_string())
+            {
+                answer_received = true;
+            }
         }
 
-        if let Some(t) = msg.transit {
-            peer_transit = Some(t);
-        }
+        peer_transit.context("No transit hints from peer")
+    };
 
-        if let Some(ans) = msg.answer
-            && ans.file_ack == Some("ok".to_string())
-        {
-            answer_received = true;
-        }
-    }
-
-    peer_transit.context("No transit hints from peer")
+    tokio::time::timeout(timeout, wait_for_peer)
+        .await
+        .context("Timed out waiting for peer to accept transfer")?
 }
 
 /// Prompt user to accept transfer, return false if rejected
@@ -593,18 +643,18 @@ async fn handle_rejection(client: &mut RendezvousClient, shared_key: &[u8]) -> R
 
 /// Send a text message through the wormhole
 pub async fn send_text(text: &str, config: &SendConfig<'_>) -> Result<()> {
-    let mut client = RendezvousClient::connect(config.relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url, config.connect_timeout).await?;
     client.bind().await?;
 
     let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
-    let shared_key = do_pake(&mut client, &code).await?;
+    let shared_key = do_pake(&mut client, &code, config.peer_timeout).await?;
 
     verify_key(&mut client, &shared_key, config.verify, true).await?;
-    exchange_versions(&mut client, &shared_key).await?;
+    exchange_versions(&mut client, &shared_key, config.peer_timeout).await?;
 
     send_app_data(&mut client, &shared_key, 0, &build_text_offer(text)).await?;
 
-    let (_, answer) = recv_app_data(&mut client, &shared_key).await?;
+    let (_, answer) = recv_app_data_timeout(&mut client, &shared_key, config.peer_timeout).await?;
 
     if let Some(err) = answer.error {
         anyhow::bail!("Transfer error: {}", err);
@@ -650,14 +700,14 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
         }
     };
 
-    let mut client = RendezvousClient::connect(config.relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url, config.connect_timeout).await?;
     client.bind().await?;
 
     let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
-    let shared_key = do_pake(&mut client, &code).await?;
+    let shared_key = do_pake(&mut client, &code, config.peer_timeout).await?;
 
     verify_key(&mut client, &shared_key, config.verify, true).await?;
-    exchange_versions(&mut client, &shared_key).await?;
+    exchange_versions(&mut client, &shared_key, config.peer_timeout).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
 
@@ -670,9 +720,14 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
     )
     .await?;
 
-    let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
-    let conn =
-        transit::connect_as_sender(&transit_key, &peer_transit, config.transit_relay).await?;
+    let peer_transit = wait_for_transit_ack(&mut client, &shared_key, config.peer_timeout).await?;
+    let conn = transit::connect_as_sender(
+        &transit_key,
+        &peer_transit,
+        config.transit_relay,
+        config.connect_timeout,
+    )
+    .await?;
 
     if let Some(compressed_data) = data {
         // Send compressed data from memory
@@ -702,14 +757,14 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
         .to_string();
     let zipsize = zip_data.len() as u64;
 
-    let mut client = RendezvousClient::connect(config.relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url, config.connect_timeout).await?;
     client.bind().await?;
 
     let (code, nameplate) = setup_sender(&mut client, config.code, config.code_length).await?;
-    let shared_key = do_pake(&mut client, &code).await?;
+    let shared_key = do_pake(&mut client, &code, config.peer_timeout).await?;
 
     verify_key(&mut client, &shared_key, config.verify, true).await?;
-    exchange_versions(&mut client, &shared_key).await?;
+    exchange_versions(&mut client, &shared_key, config.peer_timeout).await?;
 
     let transit_key = derive_transit_key(&shared_key, APP_ID);
 
@@ -722,9 +777,14 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
     )
     .await?;
 
-    let peer_transit = wait_for_transit_ack(&mut client, &shared_key).await?;
-    let conn =
-        transit::connect_as_sender(&transit_key, &peer_transit, config.transit_relay).await?;
+    let peer_transit = wait_for_transit_ack(&mut client, &shared_key, config.peer_timeout).await?;
+    let conn = transit::connect_as_sender(
+        &transit_key,
+        &peer_transit,
+        config.transit_relay,
+        config.connect_timeout,
+    )
+    .await?;
 
     let mut cursor = std::io::Cursor::new(zip_data);
     transit::send_file(&conn, &mut cursor, zipsize, config.hide_progress).await?;
@@ -740,37 +800,46 @@ pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> 
 pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
     let nameplate = nameplate_from_code(code)?;
 
-    let mut client = RendezvousClient::connect(config.relay_url).await?;
+    let mut client = RendezvousClient::connect(config.relay_url, config.connect_timeout).await?;
     client.bind().await?;
 
     let mailbox = client.claim(nameplate).await?;
     client.open(&mailbox).await?;
 
-    let shared_key = do_pake(&mut client, code).await?;
+    let shared_key = do_pake(&mut client, code, config.peer_timeout).await?;
 
     verify_key(&mut client, &shared_key, config.verify, false).await?;
-    exchange_versions(&mut client, &shared_key).await?;
+    exchange_versions(&mut client, &shared_key, config.peer_timeout).await?;
 
-    let mut offer = None;
-    let mut peer_transit = None;
+    // Wait for offer with timeout
+    let (offer, peer_transit) = {
+        let wait_for_offer = async {
+            let mut offer = None;
+            let mut peer_transit = None;
 
-    while offer.is_none() {
-        let (_, msg) = recv_app_data(&mut client, &shared_key).await?;
+            while offer.is_none() {
+                let (_, msg) = recv_app_data(&mut client, &shared_key).await?;
 
-        if let Some(err) = msg.error {
-            anyhow::bail!("Transfer error: {}", err);
-        }
+                if let Some(err) = msg.error {
+                    anyhow::bail!("Transfer error: {}", err);
+                }
 
-        if let Some(t) = msg.transit {
-            peer_transit = Some(t);
-        }
+                if let Some(t) = msg.transit {
+                    peer_transit = Some(t);
+                }
 
-        if let Some(o) = msg.offer {
-            offer = Some(o);
-        }
-    }
+                if let Some(o) = msg.offer {
+                    offer = Some(o);
+                }
+            }
 
-    let offer = offer.unwrap();
+            Ok::<_, anyhow::Error>((offer.unwrap(), peer_transit))
+        };
+
+        tokio::time::timeout(config.peer_timeout, wait_for_offer)
+            .await
+            .context("Timed out waiting for sender's offer")??
+    };
 
     if let Some(text) = offer.message {
         send_app_data(&mut client, &shared_key, 0, &build_message_ack()).await?;
@@ -820,8 +889,13 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
-        let conn =
-            transit::connect_as_receiver(&transit_key, &peer_transit, config.transit_relay).await?;
+        let conn = transit::connect_as_receiver(
+            &transit_key,
+            &peer_transit,
+            config.transit_relay,
+            config.connect_timeout,
+        )
+        .await?;
 
         if is_compressed {
             // Receive compressed data, decompress, write to file
@@ -861,8 +935,13 @@ pub async fn receive(code: &str, config: &ReceiveConfig<'_>) -> Result<()> {
         send_app_data(&mut client, &shared_key, 1, &build_file_ack()).await?;
 
         let peer_transit = peer_transit.context("No transit hints from sender")?;
-        let conn =
-            transit::connect_as_receiver(&transit_key, &peer_transit, config.transit_relay).await?;
+        let conn = transit::connect_as_receiver(
+            &transit_key,
+            &peer_transit,
+            config.transit_relay,
+            config.connect_timeout,
+        )
+        .await?;
 
         let zip_data =
             transit::receive_to_vec(&conn, dir_offer.zipsize, config.hide_progress).await?;

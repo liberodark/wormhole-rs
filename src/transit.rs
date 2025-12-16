@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crypto_secretbox::aead::{Aead, KeyInit};
@@ -170,19 +171,20 @@ pub async fn connect_as_sender(
     transit_key: &[u8; KEY_SIZE],
     peer_hints: &Transit,
     relay_addr: &str,
+    timeout: Duration,
 ) -> Result<Arc<TransitConnection>> {
     for hint in &peer_hints.hints_v1 {
         if hint.hint_type == "direct-tcp-v1"
             && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
         {
             let addr = format!("{}:{}", host, port);
-            if let Ok(conn) = try_connect_direct_sender(transit_key, &addr).await {
+            if let Ok(conn) = try_connect_direct_sender(transit_key, &addr, timeout).await {
                 return Ok(Arc::new(conn));
             }
         }
     }
 
-    let conn = connect_via_relay_sender(transit_key, relay_addr).await?;
+    let conn = connect_via_relay_sender(transit_key, relay_addr, timeout).await?;
     Ok(Arc::new(conn))
 }
 
@@ -190,27 +192,32 @@ pub async fn connect_as_receiver(
     transit_key: &[u8; KEY_SIZE],
     peer_hints: &Transit,
     relay_addr: &str,
+    timeout: Duration,
 ) -> Result<Arc<TransitConnection>> {
     for hint in &peer_hints.hints_v1 {
         if hint.hint_type == "direct-tcp-v1"
             && let (Some(host), Some(port)) = (&hint.hostname, hint.port)
         {
             let addr = format!("{}:{}", host, port);
-            if let Ok(conn) = try_connect_direct_receiver(transit_key, &addr).await {
+            if let Ok(conn) = try_connect_direct_receiver(transit_key, &addr, timeout).await {
                 return Ok(Arc::new(conn));
             }
         }
     }
 
-    let conn = connect_via_relay_receiver(transit_key, relay_addr).await?;
+    let conn = connect_via_relay_receiver(transit_key, relay_addr, timeout).await?;
     Ok(Arc::new(conn))
 }
 
 async fn try_connect_direct_sender(
     transit_key: &[u8; KEY_SIZE],
     addr: &str,
+    timeout: Duration,
 ) -> Result<TransitConnection> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .context("Connection timed out")?
+        .context("Failed to connect")?;
     configure_stream(&stream)?;
 
     let handshake = derive_transit_sender_handshake(transit_key);
@@ -232,8 +239,12 @@ async fn try_connect_direct_sender(
 async fn try_connect_direct_receiver(
     transit_key: &[u8; KEY_SIZE],
     addr: &str,
+    timeout: Duration,
 ) -> Result<TransitConnection> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .context("Connection timed out")?
+        .context("Failed to connect")?;
     configure_stream(&stream)?;
 
     let expected = derive_transit_sender_handshake(transit_key);
@@ -260,8 +271,12 @@ async fn try_connect_direct_receiver(
 async fn connect_via_relay_sender(
     transit_key: &[u8; KEY_SIZE],
     relay_addr: &str,
+    timeout: Duration,
 ) -> Result<TransitConnection> {
-    let mut stream = TcpStream::connect(relay_addr).await?;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(relay_addr))
+        .await
+        .context("Relay connection timed out")?
+        .context("Failed to connect to relay")?;
     configure_stream(&stream)?;
 
     let handshake = derive_relay_handshake(transit_key);
@@ -293,8 +308,12 @@ async fn connect_via_relay_sender(
 async fn connect_via_relay_receiver(
     transit_key: &[u8; KEY_SIZE],
     relay_addr: &str,
+    timeout: Duration,
 ) -> Result<TransitConnection> {
-    let mut stream = TcpStream::connect(relay_addr).await?;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(relay_addr))
+        .await
+        .context("Relay connection timed out")?
+        .context("Failed to connect to relay")?;
     configure_stream(&stream)?;
 
     let handshake = derive_relay_handshake(transit_key);
