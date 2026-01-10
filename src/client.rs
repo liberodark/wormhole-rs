@@ -33,6 +33,7 @@ pub struct SendConfig<'a> {
     pub connect_timeout: Duration,
     pub peer_timeout: Duration,
     pub fast: bool,
+    pub exclude_patterns: &'a [String],
 }
 
 impl Default for SendConfig<'_> {
@@ -48,6 +49,7 @@ impl Default for SendConfig<'_> {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             peer_timeout: DEFAULT_PEER_TIMEOUT,
             fast: false,
+            exclude_patterns: &[],
         }
     }
 }
@@ -799,8 +801,15 @@ pub async fn send_file(path: &Path, config: &SendConfig<'_>) -> Result<()> {
 
 /// Send a directory through the wormhole
 pub async fn send_directory(path: &Path, config: &SendConfig<'_>) -> Result<()> {
-    let archive = transit::create_archive(path, config.compression).await?;
-    let dirname = path
+    // Canonicalize path to handle "." and ".." properly
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("Cannot resolve path: {}", path.display()))?;
+
+    let archive =
+        transit::create_archive(&canonical_path, config.compression, config.exclude_patterns)
+            .await?;
+    let dirname = canonical_path
         .file_name()
         .context("Invalid directory name")?
         .to_string_lossy()

@@ -71,6 +71,10 @@ enum Commands {
         /// Use fast cipher (ChaCha20-Poly1305, incompatible with Python client)
         #[arg(long)]
         fast: bool,
+
+        /// Exclude files matching glob pattern (can be used multiple times)
+        #[arg(long, short = 'e', action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
     },
 
     #[command(visible_alias = "recv")]
@@ -153,6 +157,7 @@ async fn run_command(command: Commands) -> Result<()> {
             connect_timeout,
             peer_timeout,
             fast,
+            exclude,
         } => {
             let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
             let transit_relay = transit_relay.unwrap_or_else(|| DEFAULT_TRANSIT_RELAY.to_string());
@@ -172,6 +177,7 @@ async fn run_command(command: Commands) -> Result<()> {
                     Duration::from_secs(peer_timeout)
                 },
                 fast,
+                exclude_patterns: &exclude,
             };
 
             if let Some(text_msg) = text {

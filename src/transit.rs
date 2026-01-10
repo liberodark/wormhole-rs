@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::exclude::{ExcludePattern, compile_patterns, is_excluded};
 use anyhow::{Context, Result};
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
@@ -1092,7 +1093,7 @@ pub async fn decompress_zstd_file_to_file(input: &Path, output: &Path) -> Result
         .context("decompress task panicked")?
 }
 
-fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
+fn create_zip_sync(path: &Path, patterns: &[ExcludePattern]) -> Result<(Vec<u8>, u64, u64)> {
     use std::io::Cursor;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
@@ -1109,15 +1110,22 @@ fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
         path: &Path,
         prefix: &Path,
         options: SimpleFileOptions,
+        patterns: &[ExcludePattern],
         num_files: &mut u64,
         num_bytes: &mut u64,
     ) -> Result<()> {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
-            let name = entry_path.strip_prefix(prefix)?.to_string_lossy();
-
+            let rel_path = entry_path.strip_prefix(prefix)?;
             let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            // Skip excluded files/directories
+            if is_excluded(rel_path, metadata.is_dir(), patterns) {
+                continue;
+            }
+
+            let name = rel_path.to_string_lossy();
 
             if metadata.is_symlink() {
                 // Handle symlinks
@@ -1125,7 +1133,15 @@ fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
                 zip.add_symlink(name.to_string(), target.to_string_lossy(), options)?;
             } else if metadata.is_dir() {
                 zip.add_directory(format!("{}/", name), options)?;
-                add_dir_to_zip(zip, &entry_path, prefix, options, num_files, num_bytes)?;
+                add_dir_to_zip(
+                    zip,
+                    &entry_path,
+                    prefix,
+                    options,
+                    patterns,
+                    num_files,
+                    num_bytes,
+                )?;
             } else if metadata.is_file() {
                 zip.start_file(name.to_string(), options)?;
                 let data = std::fs::read(&entry_path)?;
@@ -1144,6 +1160,7 @@ fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
         path,
         prefix,
         options,
+        patterns,
         &mut num_files,
         &mut num_bytes,
     )?;
@@ -1155,7 +1172,10 @@ fn create_zip_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
 }
 
 /// Create zip archive to a temporary file (for large directories)
-fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, u64, u64)> {
+fn create_zip_to_tempfile_sync(
+    path: &Path,
+    patterns: &[ExcludePattern],
+) -> Result<(tempfile::NamedTempFile, u64, u64)> {
     use std::io::BufWriter;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
@@ -1173,22 +1193,37 @@ fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, 
         path: &Path,
         prefix: &Path,
         options: SimpleFileOptions,
+        patterns: &[ExcludePattern],
         num_files: &mut u64,
         num_bytes: &mut u64,
     ) -> Result<()> {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
-            let name = entry_path.strip_prefix(prefix)?.to_string_lossy();
-
+            let rel_path = entry_path.strip_prefix(prefix)?;
             let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            // Skip excluded files/directories
+            if is_excluded(rel_path, metadata.is_dir(), patterns) {
+                continue;
+            }
+
+            let name = rel_path.to_string_lossy();
 
             if metadata.is_symlink() {
                 let target = std::fs::read_link(&entry_path)?;
                 zip.add_symlink(name.to_string(), target.to_string_lossy(), options)?;
             } else if metadata.is_dir() {
                 zip.add_directory(format!("{}/", name), options)?;
-                add_dir_to_zip_file(zip, &entry_path, prefix, options, num_files, num_bytes)?;
+                add_dir_to_zip_file(
+                    zip,
+                    &entry_path,
+                    prefix,
+                    options,
+                    patterns,
+                    num_files,
+                    num_bytes,
+                )?;
             } else if metadata.is_file() {
                 zip.start_file(name.to_string(), options)?;
                 // Stream file content instead of loading all at once
@@ -1207,6 +1242,7 @@ fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, 
         path,
         prefix,
         options,
+        patterns,
         &mut num_files,
         &mut num_bytes,
     )?;
@@ -1217,7 +1253,7 @@ fn create_zip_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, 
     Ok((temp_file, num_files, num_bytes))
 }
 
-fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
+fn create_tar_zstd_sync(path: &Path, patterns: &[ExcludePattern]) -> Result<(Vec<u8>, u64, u64)> {
     use std::io::Cursor;
 
     let mut num_files = 0u64;
@@ -1235,6 +1271,7 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
         builder: &mut tar::Builder<Cursor<Vec<u8>>>,
         dir_path: &Path,
         prefix: &Path,
+        patterns: &[ExcludePattern],
         num_files: &mut u64,
         num_bytes: &mut u64,
     ) -> Result<()> {
@@ -1242,8 +1279,12 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
             let entry = entry?;
             let entry_path = entry.path();
             let rel_path = entry_path.strip_prefix(prefix)?;
-
             let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            // Skip excluded files/directories
+            if is_excluded(rel_path, metadata.is_dir(), patterns) {
+                continue;
+            }
 
             if metadata.is_symlink() {
                 // Add symlink
@@ -1264,7 +1305,7 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
                 builder.append_link(&mut header, rel_path, &target)?;
             } else if metadata.is_dir() {
                 builder.append_dir(rel_path, &entry_path)?;
-                add_dir_contents(builder, &entry_path, prefix, num_files, num_bytes)?;
+                add_dir_contents(builder, &entry_path, prefix, patterns, num_files, num_bytes)?;
             } else if metadata.is_file() {
                 *num_files += 1;
                 *num_bytes += metadata.len();
@@ -1274,7 +1315,14 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
         Ok(())
     }
 
-    add_dir_contents(&mut tar_builder, path, path, &mut num_files, &mut num_bytes)?;
+    add_dir_contents(
+        &mut tar_builder,
+        path,
+        path,
+        patterns,
+        &mut num_files,
+        &mut num_bytes,
+    )?;
 
     let tar_data = tar_builder.into_inner()?.into_inner();
     let compressed = zstd::encode_all(std::io::Cursor::new(&tar_data), ZSTD_LEVEL)?;
@@ -1283,7 +1331,10 @@ fn create_tar_zstd_sync(path: &Path) -> Result<(Vec<u8>, u64, u64)> {
 }
 
 /// Create tar+zstd archive to a temporary file (for large directories)
-fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempFile, u64, u64)> {
+fn create_tar_zstd_to_tempfile_sync(
+    path: &Path,
+    patterns: &[ExcludePattern],
+) -> Result<(tempfile::NamedTempFile, u64, u64)> {
     use std::io::BufWriter;
 
     let mut num_files = 0u64;
@@ -1303,6 +1354,7 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
         builder: &mut tar::Builder<W>,
         dir_path: &Path,
         prefix: &Path,
+        patterns: &[ExcludePattern],
         num_files: &mut u64,
         num_bytes: &mut u64,
     ) -> Result<()> {
@@ -1310,8 +1362,12 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
             let entry = entry?;
             let entry_path = entry.path();
             let rel_path = entry_path.strip_prefix(prefix)?;
-
             let metadata = std::fs::symlink_metadata(&entry_path)?;
+
+            // Skip excluded files/directories
+            if is_excluded(rel_path, metadata.is_dir(), patterns) {
+                continue;
+            }
 
             if metadata.is_symlink() {
                 let target = std::fs::read_link(&entry_path)?;
@@ -1331,7 +1387,14 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
                 builder.append_link(&mut header, rel_path, &target)?;
             } else if metadata.is_dir() {
                 builder.append_dir(rel_path, &entry_path)?;
-                add_dir_contents_to_tar(builder, &entry_path, prefix, num_files, num_bytes)?;
+                add_dir_contents_to_tar(
+                    builder,
+                    &entry_path,
+                    prefix,
+                    patterns,
+                    num_files,
+                    num_bytes,
+                )?;
             } else if metadata.is_file() {
                 *num_files += 1;
                 *num_bytes += metadata.len();
@@ -1341,7 +1404,14 @@ fn create_tar_zstd_to_tempfile_sync(path: &Path) -> Result<(tempfile::NamedTempF
         Ok(())
     }
 
-    add_dir_contents_to_tar(&mut tar_builder, path, path, &mut num_files, &mut num_bytes)?;
+    add_dir_contents_to_tar(
+        &mut tar_builder,
+        path,
+        path,
+        patterns,
+        &mut num_files,
+        &mut num_bytes,
+    )?;
 
     // Finish tar and zstd compression
     let zstd_writer = tar_builder.into_inner()?;
@@ -1486,9 +1556,15 @@ fn extract_tar_zstd_from_file_sync(archive_path: &Path, output_path: &Path) -> R
 ///
 /// Automatically chooses between in-memory and tempfile based on available RAM.
 /// This prevents OOM crashes when archiving large directories.
-pub async fn create_archive(path: &Path, compression: Compression) -> Result<ArchiveResult> {
+pub async fn create_archive(
+    path: &Path,
+    compression: Compression,
+    exclude_patterns: &[String],
+) -> Result<ArchiveResult> {
     let path = path.to_path_buf();
+    let patterns: Vec<String> = exclude_patterns.to_vec();
     tokio::task::spawn_blocking(move || {
+        let compiled_patterns = compile_patterns(&patterns);
         let dir_size = calculate_dir_size(&path);
         let use_tempfile = should_use_tempfile(dir_size);
 
@@ -1496,7 +1572,8 @@ pub async fn create_archive(path: &Path, compression: Compression) -> Result<Arc
             Compression::Zip => {
                 if use_tempfile {
                     // Large directory - use tempfile to avoid OOM
-                    let (temp_file, num_files, num_bytes) = create_zip_to_tempfile_sync(&path)?;
+                    let (temp_file, num_files, num_bytes) =
+                        create_zip_to_tempfile_sync(&path, &compiled_patterns)?;
                     Ok(ArchiveResult {
                         source: ArchiveSource::TempFile(temp_file),
                         num_files,
@@ -1504,7 +1581,7 @@ pub async fn create_archive(path: &Path, compression: Compression) -> Result<Arc
                     })
                 } else {
                     // Small enough - use memory (faster)
-                    let (data, num_files, num_bytes) = create_zip_sync(&path)?;
+                    let (data, num_files, num_bytes) = create_zip_sync(&path, &compiled_patterns)?;
                     Ok(ArchiveResult {
                         source: ArchiveSource::Memory(data),
                         num_files,
@@ -1516,7 +1593,7 @@ pub async fn create_archive(path: &Path, compression: Compression) -> Result<Arc
                 if use_tempfile {
                     // Large directory - use tempfile to avoid OOM
                     let (temp_file, num_files, num_bytes) =
-                        create_tar_zstd_to_tempfile_sync(&path)?;
+                        create_tar_zstd_to_tempfile_sync(&path, &compiled_patterns)?;
                     Ok(ArchiveResult {
                         source: ArchiveSource::TempFile(temp_file),
                         num_files,
@@ -1524,7 +1601,8 @@ pub async fn create_archive(path: &Path, compression: Compression) -> Result<Arc
                     })
                 } else {
                     // Small enough - use memory (faster)
-                    let (data, num_files, num_bytes) = create_tar_zstd_sync(&path)?;
+                    let (data, num_files, num_bytes) =
+                        create_tar_zstd_sync(&path, &compiled_patterns)?;
                     Ok(ArchiveResult {
                         source: ArchiveSource::Memory(data),
                         num_files,
