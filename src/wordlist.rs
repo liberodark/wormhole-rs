@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 
 const WORD_PAIRS: [(&str, &str); 256] = [
     ("aardvark", "adroitness"),

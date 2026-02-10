@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use hkdf::Hkdf;
-use rand::Rng;
+use rand::RngExt;
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
