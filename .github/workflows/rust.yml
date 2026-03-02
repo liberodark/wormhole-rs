@@ -144,19 +144,19 @@ jobs:
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/wormhole-rs${{ matrix.ext }}" -DestinationPath "wormhole-rs-${{ env.VERSION }}-${{ matrix.name }}.zip"
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wormhole-rs-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/wormhole-rs${{ matrix.ext }}
       - name: Upload tarball artifact
         if: startsWith(github.ref, 'refs/tags/v') && runner.os != 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wormhole-rs-${{ matrix.name }}-tarball
           path: wormhole-rs-${{ env.VERSION }}-${{ matrix.name }}.tar.gz
       - name: Upload zip artifact
         if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wormhole-rs-${{ matrix.name }}-zip
           path: wormhole-rs-${{ env.VERSION }}-${{ matrix.name }}.zip
