@@ -18,7 +18,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 spake2 = "0.4"
 hkdf = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 crypto_secretbox = "0.1"
 ring = "0.17"
 blake3 = "1.8"
