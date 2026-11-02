@@ -30,7 +30,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 tar = "0.4"
 zstd = "0.14"
 indicatif = "0.18"
-sysinfo = "0.39"
+sysinfo = "0.40"
 tempfile = "3.27"
 
 [profile.release]
